@@ -69,7 +69,14 @@ class RagPipeline:
         config: RagConfig | None = None,
         embedder: Embedder | None = None,
         allow_embedding_fallback: bool = True,
+        create: bool = True,
     ):
+        """
+        :param create: 知识库目录不存在时是否自动创建。
+            入库/建库场景应为 True;只读查询场景应为 False —— 否则用户传错库名时会静默
+            在 rag_data/ 下建出一个空目录,后续查询都得到「库是空的」这种误导性结果,
+            而不是「库不存在」这个真实原因。
+        """
         self.config = config or load_rag_config()
         self.kb = kb or self.config.default_kb
         self.kb_dir = self.config.kb_dir(self.kb)
@@ -89,7 +96,7 @@ class RagPipeline:
         self.store = VectorStore.open(
             self.kb_dir,
             embedding_fingerprint=self.embedder.fingerprint,
-            create=True,
+            create=create,
         )
         # 切块参数变化时给出提示:旧 chunk 是按老参数切的,混用会导致检索质量下降
         old_size = self.store.meta.get("chunk_size")
@@ -357,16 +364,28 @@ def get_pipeline(
     kb: str | None = None,
     config: RagConfig | None = None,
     embedder: Embedder | None = None,
+    create: bool = True,
 ) -> RagPipeline:
-    """获取(带缓存的)知识库流水线。"""
+    """获取(带缓存的)知识库流水线。
+
+    :param create: 见 RagPipeline.__init__。Agent 工具等只读场景应传 False,
+        让「库不存在」直接暴露为 FileNotFoundError,而不是建出一个空库。
+    """
     config = config or load_rag_config()
     kb_name = kb or config.default_kb
-    key = (kb_name, config.embedding_provider, config.embedding_model, config.chunk_size, id(embedder))
+    key = (
+        kb_name,
+        config.embedding_provider,
+        config.embedding_model,
+        config.chunk_size,
+        create,
+        id(embedder),
+    )
     if embedder is not None:
         # 外部注入的 embedder 不缓存,避免测试之间互相污染
-        return RagPipeline(kb=kb_name, config=config, embedder=embedder)
+        return RagPipeline(kb=kb_name, config=config, embedder=embedder, create=create)
     if key not in _PIPELINES:
-        _PIPELINES[key] = RagPipeline(kb=kb_name, config=config)
+        _PIPELINES[key] = RagPipeline(kb=kb_name, config=config, create=create)
     return _PIPELINES[key]
 
 

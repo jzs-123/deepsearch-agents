@@ -12,6 +12,9 @@
 
 为什么不像 RAGFlow 那样「创建会话再提问」:自研检索是无状态的纯函数调用,每次检索独立、
 不存在跨轮上下文污染,所以不需要会话语义,也不需要「用完即删」的资源清理。
+
+只读语义:查询类工具一律以 create=False 打开知识库。用户或模型传了不存在的库名时,
+必须报「库不存在」并列出可用库,而不是悄悄建出一个空库(见 _open_pipeline_for_query)。
 """
 
 from __future__ import annotations
@@ -22,8 +25,33 @@ from langchain_core.tools import tool
 
 from app.api.monitor import monitor
 from app.rag.config import load_rag_config
-from app.rag.pipeline import get_pipeline
+from app.rag.pipeline import RagPipeline, get_pipeline
 from app.rag.vectorstore import EmbeddingMismatchError, list_knowledge_bases as _list_kbs
+
+
+def _open_pipeline_for_query(kb_name: str) -> RagPipeline:
+    """只读地打开知识库:库不存在时抛 FileNotFoundError,而不是静默新建空库。
+
+    背景:早期实现用 get_pipeline(create=True),模型一旦传了不存在的库名(幻觉出的库名、
+    或用户口误),就会在 rag_data/ 下建出一个空目录,之后所有查询都返回「库是空的」,
+    把「库不存在」这个真实原因掩盖掉,还留下垃圾目录。这里显式关闭创建。
+    """
+    return get_pipeline(kb=kb_name or None, create=False)
+
+
+def _missing_kb_hint(kb_name: str) -> str:
+    """库不存在时给出可用库清单,帮助模型自我纠正。"""
+    try:
+        bases = _list_kbs(load_rag_config().data_path)
+        names = [item["name"] for item in bases if item["chunk_count"] > 0]
+    except Exception:
+        names = []
+    available = "、".join(names) if names else "(当前没有任何已入库的知识库)"
+    return (
+        f"知识库 {kb_name!r} 不存在,未创建也不会自动创建。"
+        f"当前可用的知识库:{available}。"
+        f"请改用已有知识库名称,或先由管理员执行入库命令。"
+    )
 
 
 @tool
@@ -68,7 +96,7 @@ def search_knowledge_base(question: str, kb_name: str = "", top_n: int = 4) -> s
     :param question: 检索问题或关键词,尽量包含专有名词(型号、编号、指标名)以提升命中率
     :param kb_name: 知识库名称,留空则使用默认知识库
     :param top_n: 返回片段数量,默认 4
-    :return: 带来源编号和相似度的原文片段;检索不到时返回中文提示
+    :return: 带来源编号和相似度的原文片段;检索不到或库不存在时返回中文提示
     """
     monitor.report_tool(
         tool_name="自研RAG知识库检索工具：search_knowledge_base",
@@ -76,14 +104,15 @@ def search_knowledge_base(question: str, kb_name: str = "", top_n: int = 4) -> s
     )
 
     try:
-        pipeline = get_pipeline(kb=kb_name or None)
+        pipeline = _open_pipeline_for_query(kb_name)
         if not len(pipeline.store):
             return f"知识库 {pipeline.kb} 是空的,没有可检索的文档。"
+
         results = pipeline.search(question, top_n=max(1, min(int(top_n), 10)))
         if not results:
             return "知识库中没有检索到相关内容。"
-        # 低于阈值的结果不作为依据返回,避免把无关内容塞给模型造成幻觉。
-        # 注意必须用 grounded_score()(向量余弦)而不是 results[0].score:
+
+        # 门槛判定必须用 grounded_score()(向量余弦),而不是 results[0].score:
         # 后者在开启重排后是「词面覆盖率/大模型打分」,尺度与 min_score 完全不同,
         # 混用会让无关问题越过阈值(同类问题见 docs/rag-self-built.md 5.10)。
         gate_score = pipeline.grounded_score(results)
@@ -99,6 +128,8 @@ def search_knowledge_base(question: str, kb_name: str = "", top_n: int = 4) -> s
             for item in results
         ]
         return f"在知识库 {pipeline.kb} 中检索到 {len(results)} 个相关片段:\n\n" + "\n\n".join(blocks)
+    except FileNotFoundError:
+        return _missing_kb_hint(kb_name or load_rag_config().default_kb)
     except EmbeddingMismatchError as exc:
         return f"知识库向量配置不匹配,需要重新入库:{exc}"
     except Exception as exc:
@@ -122,9 +153,10 @@ def ask_knowledge_base(question: str, kb_name: str = "") -> str:
     )
 
     try:
-        pipeline = get_pipeline(kb=kb_name or None)
+        pipeline = _open_pipeline_for_query(kb_name)
         if not len(pipeline.store):
             return f"知识库 {pipeline.kb} 是空的,没有可检索的文档。"
+
         answer = pipeline.query(question)
         lines = [answer.answer]
         if answer.citations:
@@ -138,6 +170,8 @@ def ask_knowledge_base(question: str, kb_name: str = "") -> str:
         if not answer.grounded:
             lines.append(f"\n（检索调试信息:{json.dumps(answer.debug, ensure_ascii=False)}）")
         return "\n".join(lines)
+    except FileNotFoundError:
+        return _missing_kb_hint(kb_name or load_rag_config().default_kb)
     except EmbeddingMismatchError as exc:
         return f"知识库向量配置不匹配,需要重新入库:{exc}"
     except Exception as exc:
