@@ -1,0 +1,10 @@
+{
+  "chunk_size": 500,
+  "chunk_overlap": 80,
+  "embedding_provider": "hash",
+  "kb": "fin",
+  "embedding_fingerprint": "hash:512",
+  "dim": 512,
+  "chunk_count": 238,
+  "updated_at": "2026-10-10 12:08:25"
+}

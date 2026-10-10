@@ -1,0 +1,37 @@
+{
+  "description": "真实研报语料的检索评测集（对应 docs/knowledge_base/金融行业，共 143 页 PDF）。expected_sources 只写文件名即可，比对时忽略目录；expect_no_answer 用于验证无依据时是否正确拒答。",
+  "items": [
+    {
+      "question": "2025年第四季度中国人民银行实施了什么类型的货币政策",
+      "expected_sources": ["中国人民银行2025年第四季度中国货币政策执行报告63页.pdf"]
+    },
+    {
+      "question": "贝莱德 2026 年全球投资展望报告的引言讨论了什么核心议题",
+      "expected_sources": ["贝莱德BlackRock2026年全球投资展望报告17页.pdf"]
+    },
+    {
+      "question": "长江商学院投资者情绪调查的样本是如何构成的",
+      "expected_sources": ["长江商学院2025年投资者情绪问卷调查CKISS四季度报告63页.pdf"]
+    },
+    {
+      "question": "货币信贷概况的主要内容是什么",
+      "expected_sources": ["中国人民银行2025年第四季度中国货币政策执行报告63页.pdf"]
+    },
+    {
+      "question": "问卷调查研究如何计算财政赤字占GDP比重",
+      "expected_sources": ["长江商学院2025年投资者情绪问卷调查CKISS四季度报告63页.pdf"]
+    },
+    {
+      "question": "公司食堂本周的菜单是什么",
+      "expect_no_answer": true
+    },
+    {
+      "question": "如何用 Python 实现一个二叉搜索树",
+      "expect_no_answer": true
+    },
+    {
+      "question": "本次项目组团建的行程安排",
+      "expect_no_answer": true
+    }
+  ]
+}

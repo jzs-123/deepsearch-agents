@@ -1,0 +1,37 @@
+{
+  "description": "自研 RAG 检索评测集示例。expected_sources 填「来源文件相对路径」,只要该文件的任一 chunk 出现在 top-k 即算命中;expect_no_answer 用于验证无依据时是否正确拒答。",
+  "items": [
+    {
+      "question": "金融电商业务分析建议优先分析哪些场景",
+      "expected_sources": ["sub_dir/金融电商行业分析报告.md"]
+    },
+    {
+      "question": "高客单价订单转化率当前是多少",
+      "expected_sources": ["sub_dir/测试文件.md"]
+    },
+    {
+      "question": "会员用户复购率的表现和业务含义",
+      "expected_sources": ["sub_dir/测试文件.md"]
+    },
+    {
+      "question": "金融业务接入电商场景需要同时关注什么",
+      "expected_sources": ["sub_dir/金融电商行业分析报告.md", "sub_dir/测试文件.md"]
+    },
+    {
+      "question": "异常交易拦截后需要分析什么风险",
+      "expected_sources": ["sub_dir/测试文件.md"]
+    },
+    {
+      "question": "2026 年业务策略里支付体验和风险控制的关系",
+      "expected_sources": ["sub_dir/金融电商行业分析报告.md"]
+    },
+    {
+      "question": "公司食堂本周的菜单是什么",
+      "expect_no_answer": true
+    },
+    {
+      "question": "量子计算机的量子纠错码如何实现",
+      "expect_no_answer": true
+    }
+  ]
+}
