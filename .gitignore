@@ -9,6 +9,22 @@ app/updated
 # Only exists if Bazel was run
 /bazel-out
 
+# 自研 RAG 与测试产生的运行时目录（勿提交）
+# tmpdir：pytest/本地探针的临时工作目录（沙箱下只能用已存在目录当 basetemp）
+# .uv-cache：pytest 等依赖的离线兜底副本
+# .agent-teams：多智能体协作的运行态状态
+# 注意：rag_data/ 与 vendor/ 已随首次提交纳入版本控制，此处不再忽略。
+tmpdir/
+.uv-cache/
+.agent-teams/
+# 沙箱可写性探针：由子进程无法删除（docs/ 对子进程只读），保留作为环境限制的活体证据
+docs/__envi_write_probe.md
+# 成员的临时探针与日志，不应进入仓库
+basetemp-probe.log
+tests/test_basetemp_probe.py
+# 成员调试时在仓库根留下的单字母日志(a.log … e.log 之类)
+/[a-e].log
+
 # dependencies
 /node_modules
 frontend/node_modules/

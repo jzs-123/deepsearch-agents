@@ -82,11 +82,15 @@ def search_knowledge_base(question: str, kb_name: str = "", top_n: int = 4) -> s
         results = pipeline.search(question, top_n=max(1, min(int(top_n), 10)))
         if not results:
             return "知识库中没有检索到相关内容。"
-        # 低于阈值的结果不作为依据返回,避免把无关内容塞给模型造成幻觉
-        if results[0].score < pipeline.config.min_score:
+        # 低于阈值的结果不作为依据返回,避免把无关内容塞给模型造成幻觉。
+        # 注意必须用 grounded_score()(向量余弦)而不是 results[0].score:
+        # 后者在开启重排后是「词面覆盖率/大模型打分」,尺度与 min_score 完全不同,
+        # 混用会让无关问题越过阈值(同类问题见 docs/rag-self-built.md 5.10)。
+        gate_score = pipeline.grounded_score(results)
+        if gate_score < pipeline.config.min_score:
             return (
                 f"知识库 {pipeline.kb} 中没有与该问题足够相关的资料"
-                f"(最高匹配度 {results[0].score:.3f},低于阈值 {pipeline.config.min_score})。"
+                f"(最高匹配度 {gate_score:.3f},低于阈值 {pipeline.config.min_score})。"
             )
 
         blocks = [
