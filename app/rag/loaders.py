@@ -57,8 +57,12 @@ def normalize_text(text: str) -> str:
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\xa0", " ").replace("\u200b", "").replace("\ufeff", "")
-    # 中文字符之间的多余空格(PDF 逐字抽取的常见副作用)
-    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+    # 中文字符之间的多余空格(PDF 逐字抽取的常见副作用)。
+    # 注意必须用 [ \t]+ 而不是 \s+:后者包含换行,会把中文之间的换行一并删掉,
+    # 于是「# 标题\n\n正文」被压成「# 标题正文」——标题吞掉正文 → 标题识别失败 →
+    # 整篇退化成 1 个 chunk、heading 全空。这种退化不报错、只降质,极难发现
+    # (与 re.MULTILINE 那个坑症状相同但根因不同,详见 docs/rag-self-built.md)。
+    text = re.sub(r"(?<=[\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])", "", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
