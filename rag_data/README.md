@@ -24,31 +24,36 @@ rag_data/
 
 | 目录 | 说明 |
 | --- | --- |
-| `fin` | 已入库的真实研报示例（`docs/knowledge_base/金融行业` 下 3 份 PDF，143 页 → 238 个片段，使用 hash 兜底向量建的，可直接用于检索演示） |
+| `fin` | 已入库的真实研报示例（`docs/knowledge_base/金融行业` 下 3 份 PDF，143 页 → **248 个片段**，用 hash 兜底向量建的，可直接用于检索演示） |
 
 > 这些是运行时数据，可随时删除重建。注意**向量后端要与建库时一致**：`fin` 是用 `hash` 后端建的，
 > 用 `local`/`openai` 后端查询会被指纹校验拦下——这正是设计意图，防止跨向量空间检索产生无意义结果。
+> 想直接用示例库，把默认知识库设为它即可：`RAG_DEFAULT_KB=fin`。
+>
+> 248 这个数字是可复现的：用当前代码重跑
+> `python -m app.rag.cli ingest -k fin -p docs/knowledge_base/金融行业 --embedding-provider hash`
+> 会得到同样结果（逐文件 134 / 53 / 61）。
 
 ## 常用命令
 
 ```bash
 # 入库(支持 .pdf / .docx / .md / .txt / .csv,可传目录递归)
-python -m app.rag.cli ingest -k default -p docs/knowledge_base
+python -m app.rag.cli ingest -k fin -p docs/knowledge_base
 
 # 查看知识库状态
-python -m app.rag.cli stats -k default
+python -m app.rag.cli stats -k fin
 
 # 只做检索(不调用大模型,便于调参)
-python -m app.rag.cli search -k default -q "风控策略有哪些要求"
+python -m app.rag.cli search -k fin -q "风控策略有哪些要求"
 
 # 检索 + 生成带引用的答案
-python -m app.rag.cli ask -k default -q "风控策略有哪些要求"
+python -m app.rag.cli ask -k fin -q "风控策略有哪些要求"
 
 # 用评测集评估检索质量
-python -m app.rag.cli eval -k default -e examples/rag_eval_set.json
+python -m app.rag.cli eval -k fin -e examples/rag_eval_set.json
 
 # 清空某个知识库(不可恢复)
-python -m app.rag.cli reset -k default --yes
+python -m app.rag.cli reset -k fin --yes
 ```
 
 ## 注意事项

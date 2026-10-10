@@ -32,12 +32,45 @@ dependencies = [
     "typing-extensions>=4.5.0",
     "uvicorn[standard]>=0.20.0",
     # --- 自研 RAG (app/rag, 替代外部 RAGFlow 服务) ---
-    "sentence-transformers>=3.0.0,<6.0.0",  # 本地中文向量模型(BGE);不装则自动降级为 hash 离线向量
-    "jieba>=0.42.1",                        # 中文分词,BM25 与词面重排依赖
-    # "faiss-cpu>=1.7.4",                   # 可选:装了则加速向量检索,不装走 numpy 全量点积(精确)
+    "jieba>=0.42.1",                        # 中文分词,BM25 与词面重排依赖(纯 Python,轻量)
+    # --- 本地向量模型:改为可选 extra,不进默认安装 ---
+    # 为什么移出核心依赖:它牵动 torch(数百 MB~数 GB)。本机 pip/uv 装 torch 系依赖时会空转卡死
+    # (详见 docs/rag-agent-env.md),而裸 `uv sync` 会因此直奔 torch —— 这是 R1 记录的漂移陷阱。
+    # 默认向量后端若不可用,app/rag/embedding.py 会自动降级为 hash 离线向量,链路仍然可用。
+    # 需要真实语义向量时显式安装: uv sync --extra local-embedding
+    #                             或 pip install -e ".[local-embedding]"
     # --- 旧 RAGFlow 集成(已下线,保留仅作回滚参考) ---
     # "ragflow-sdk>=0.1.0",                 # 新链路不再依赖,app/ragflow 已不在 Agent 装配中
 ]
 
 [tool.uv]
 package = false
+
+# ── 可选依赖组 ────────────────────────────────────────────────────────
+[project.optional-dependencies]
+# 测试依赖(t8/t9 发现 R2:套件原本依赖一个 gitignored 的离线 pytest 副本,
+# 干净检出上没有正规安装路径,这里补上)
+test = [
+    "pytest>=9.0",
+]
+# 本地中文向量模型(BGE)。装上后把 RAG_EMBEDDING_PROVIDER 设为 local;
+# 注意:换向量后端必须重新入库 —— 既有知识库(如 rag_data/fin 的 hash:512)会因
+# 向量指纹不一致而被 EmbeddingMismatchError 拦下,这是有意的保护,不是 bug。
+local-embedding = [
+    "sentence-transformers>=3.0.0,<6.0.0",
+]
+
+# ── pytest 配置（t2 新增）──────────────────────────────────────────────
+# addopts 里的两个 -p no:* 不是可有可无的装饰，而是本沙箱的硬约束：
+#   -p no:tmpdir      禁用 pytest 自带的 tmpdir 插件。它会用 os.mkdir(..., 0o700) 建 basetemp，
+#                     而本沙箱下 0o700 目录会让进程自己都无法访问（3.12/3.13 上必崩，
+#                     且目录永久不可删）。禁掉后 basetemp 根本不会被创建；
+#                     tmp_path 由 tests/conftest.py 用默认 mode 自供，行为不变。
+#   -p no:cacheprovider 不写 .pytest_cache（保持工作区干净，避免 git status 噪声）。
+# 详见 docs/rag-agent-test-plan.md 6.1.1 与 R1。
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:tmpdir -p no:cacheprovider"
+markers = [
+    "e2e: 需要真实大模型/网络/已入库知识库的端到端用例（默认跳过，RAG_E2E=1 开启）",
+]
