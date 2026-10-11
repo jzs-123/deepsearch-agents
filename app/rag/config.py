@@ -67,6 +67,18 @@ class RagConfig:
     ocr_min_text_chars: int = 50
     ocr_language: str = "zh-Hans-CN"
 
+    # 缓存(embedding / 查询结果 / 生成结果)
+    # **默认关闭**:查询与生成缓存一旦陈旧就是"返回过期答案",这种风险不该由默认配置承担;
+    # embedding 缓存是内容寻址(不陈旧)但共用这个总开关,保证"一个开关解释全部行为"。
+    # 见 docs/rag-enterprise-features.md。
+    cache_enabled: bool = False
+
+    # 审计日志(JSONL;每次 search/query 一条,不含原文)
+    # 默认开启:审计是这次明确要的能力,且写入失败只 warning、不影响查询。
+    audit_enabled: bool = True
+    # 审计目录;留空 = 跟随知识库数据根目录下的 .audit/(默认即 rag_data/.audit/)
+    audit_dir: str = ""
+
     # 生成所用大模型(与主项目共用一套 OpenAI 兼容配置)
     llm_model: str = ""
     llm_base_url: str = ""
@@ -112,6 +124,21 @@ class RagConfig:
             language=self.ocr_language,
         )
 
+    def cache_dir(self, kb: str | None = None) -> Path:
+        """缓存目录:`<kb 目录>/.cache/`(缓存与数据同库同生共死,reset 时一起清)。"""
+        return self.kb_dir(kb) / ".cache"
+
+    def audit_path(self, kb: str | None = None) -> Path:
+        """审计目录:默认 `<数据根>/.audit/`,可用 RAG_AUDIT_DIR 覆盖成独立目录。
+
+        为什么默认跟着数据根走而不是写死 `rag_data/.audit/`:测试与 selftest 用的是临时数据目录,
+        跟着走就不会往真实的 rag_data/ 里写审计文件;而默认数据根就是 rag_data,所以默认行为
+        仍然是任务要求的 `rag_data/.audit/`。
+        """
+        if self.audit_dir:
+            return Path(self.audit_dir)
+        return self.data_path / ".audit"
+
     @property
     def data_path(self) -> Path:
         return Path(self.data_dir)
@@ -149,6 +176,9 @@ def load_rag_config(**overrides) -> RagConfig:
         ocr_backend=settings.rag_ocr_backend,
         ocr_min_text_chars=settings.rag_ocr_min_text_chars,
         ocr_language=settings.rag_ocr_language,
+        cache_enabled=settings.rag_cache_enabled,
+        audit_enabled=settings.rag_audit_enabled,
+        audit_dir=settings.rag_audit_dir,
         llm_model=settings.llm_model,
         llm_base_url=settings.openai_base_url,
         llm_api_key=settings.openai_api_key,

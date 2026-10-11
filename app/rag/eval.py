@@ -108,6 +108,7 @@ def evaluate(
     items: list[EvalItem],
     k: int = 5,
     rewrite: bool | None = None,
+    filter: dict | None = None,
 ) -> EvalResult:
     """对给定流水线跑一遍评测。
 
@@ -116,6 +117,7 @@ def evaluate(
 
     :param rewrite: 透传给 `pipeline.search`:None=按配置(默认 local,低分自动重试)、
         False=关闭改写(对比基线)、True=首轮就用全部变体
+    :param filter: 元数据过滤(同一条件应用到全部样本),便于对比"加过滤前后的检索质量"
     """
     result = EvalResult(total=len(items))
     result.config = {
@@ -130,6 +132,7 @@ def evaluate(
         "query_variants": pipeline.config.query_variants,
         "retry_on_low_score": pipeline.config.retry_on_low_score,
         "rewrite_override": rewrite,
+        "filter": filter or {},
         "k": k,
     }
 
@@ -158,6 +161,7 @@ def evaluate(
             top_k=max(k, pipeline.config.top_k),
             top_n=k,
             rewrite=rewrite,
+            filter=filter,
         )
         retrieved = [c.chunk.source for c in chunks]
         # 拒答判定与线上一致:一律用向量余弦(重排分的尺度不能直接和阈值比)

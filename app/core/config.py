@@ -97,6 +97,18 @@ class Settings(BaseSettings):
     # OCR 语言(BCP-47);Windows 需已安装对应语言包,否则引擎创建失败并降级
     rag_ocr_language: str = "zh-Hans-CN"
 
+    # ─── 自研 RAG:缓存(embedding / 查询结果 / 生成结果) ───
+    # 默认关闭:查询与生成缓存一旦陈旧就是"返回过期答案",不该由默认配置承担这个风险;
+    # embedding 缓存是内容寻址(不陈旧)但共用这个总开关,保证"一个开关解释全部行为"。
+    # 缓存文件落在 rag_data/<kb>/.cache/(已加入 .gitignore)
+    rag_cache_enabled: bool = False
+
+    # ─── 自研 RAG:审计日志(JSONL;每次 search/query 一条,不含原文) ───
+    # 默认开启;写入失败只 warning,绝不影响查询
+    rag_audit_enabled: bool = True
+    # 审计目录;留空 = 跟随知识库数据根目录下的 .audit/(默认即 rag_data/.audit/)
+    rag_audit_dir: str = ""
+
     # ─── MySQL ────────────────────────────────────────────
     mysql_user: str = "root"
     mysql_password: str = "root"

@@ -61,6 +61,7 @@ class RetrievedChunk:
     :param rrf_score: RRF 融合分
     :param rank: 在当前结果列表中的位次(从 1 开始,重排后重算)
     :param channels: 命中该 chunk 的检索通道,如 ["dense", "sparse"]
+    :param cached: 本条结果是否直接来自查询结果缓存(命中缓存时必须显式标注)
     """
 
     chunk: Chunk
@@ -70,6 +71,7 @@ class RetrievedChunk:
     rrf_score: float = 0.0
     rank: int = 0
     channels: list[str] = field(default_factory=list)
+    cached: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

@@ -1,0 +1,25 @@
+{
+  "_schema": "RAGAS 生成质量评测集（t14）。与 examples/rag_eval_set*.json（检索评测集）刻意分开：那份测召回，这份测生成。",
+  "description": "字段说明 —— question 必填；ground_truth 是参考答案（context_precision / context_recall 需要它，缺失时这两个指标会自动省略）；expected_sources 期望来源文件名（与检索评测集同一套写法，便于两边共用）；expect_no_answer=true 表示该题应当拒答，不参与生成质量打分。",
+  "items": [
+    {
+      "question": "2025年第四季度中国人民银行实施了什么类型的货币政策",
+      "ground_truth": "实施适度宽松的货币政策，并在存量政策基础上推出一揽子货币金融政策组合，强化逆周期调节。",
+      "expected_sources": ["中国人民银行2025年第四季度中国货币政策执行报告63页.pdf"]
+    },
+    {
+      "question": "货币信贷概况的主要内容是什么",
+      "ground_truth": "货币信贷概况介绍报告期内货币供应量、信贷投放与社会融资规模等金融统计数据的总体情况。",
+      "expected_sources": ["中国人民银行2025年第四季度中国货币政策执行报告63页.pdf"]
+    },
+    {
+      "question": "长江商学院投资者情绪调查的样本是如何构成的",
+      "ground_truth": "该调查通过问卷方式采集投资者情绪，样本覆盖不同地区与不同类型的投资者群体。",
+      "expected_sources": ["长江商学院2025年投资者情绪问卷调查CKISS四季度报告63页.pdf"]
+    },
+    {
+      "question": "公司食堂本周的菜单是什么",
+      "expect_no_answer": true
+    }
+  ]
+}

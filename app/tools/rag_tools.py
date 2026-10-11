@@ -25,6 +25,12 @@ from langchain_core.tools import tool
 
 from app.api.monitor import monitor
 from app.rag.config import load_rag_config
+from app.rag.metadata import (
+    InvalidFilterError,
+    format_filter_hint,
+    normalize_filter,
+    parse_filter_json,
+)
 from app.rag.pipeline import RagPipeline, format_search_audit, get_pipeline
 from app.rag.vectorstore import EmbeddingMismatchError, list_knowledge_bases as _list_kbs
 
@@ -95,19 +101,47 @@ def list_knowledge_bases() -> str:
         lines = ["可用知识库："]
         for item in bases:
             state = "（空库，暂不可检索）" if item["chunk_count"] == 0 else ""
+            fields = item.get("filter_fields") or []
+            fields_text = "、".join(fields) if fields else "无"
             lines.append(
                 f"- {item['name']}: {item['chunk_count']} 个片段"
                 f" | 向量模型 {item['embedding'] or '未初始化'}"
-                f" | 更新时间 {item['updated_at'] or '-'}{state}"
+                f" | 更新时间 {item['updated_at'] or '-'}"
+                f" | 可过滤字段 {fields_text}{state}"
             )
         lines.append(f"\n默认知识库:{config.default_kb}")
+        lines.append(
+            "提示:过滤字段来自文档头部 YAML frontmatter(如 部门/类型/密级/版本)与系统字段"
+            "(file/path/suffix);调用检索/问答工具时可用 filter_json 传 JSON(如 {\"部门\": \"风控\"})。"
+        )
         return "\n".join(lines)
     except Exception as exc:
         return f"查询知识库列表异常:{exc}"
 
 
+def _parse_tool_filter(filter_json: str) -> tuple[dict, str]:
+    """解析工具层的 filter_json;返回 (filter, 错误提示)。非法输入不抛异常,交给模型自我纠正。"""
+    if not filter_json:
+        return {}, ""
+    try:
+        return parse_filter_json(filter_json), ""
+    except InvalidFilterError as exc:
+        return {}, f"过滤条件不合法:{exc}"
+
+
+def _filter_miss_message(kb: str, filter_spec: dict, pipeline) -> str:
+    """过滤把候选清空时的专用提示:必须指向"过滤条件",而不是笼统的"没检索到"。"""
+    try:
+        hint = format_filter_hint(normalize_filter(filter_spec), pipeline.filter_fields)
+    except Exception:  # noqa: BLE001 - 提示本身不能再抛异常
+        hint = f"没有符合过滤条件 {filter_spec} 的片段。"
+    return f"知识库 {kb} 中{hint}"
+
+
 @tool
-def search_knowledge_base(question: str, kb_name: str = "", top_n: int = 4) -> str:
+def search_knowledge_base(
+    question: str, kb_name: str = "", top_n: int = 4, filter_json: str = ""
+) -> str:
     """
     在企业内部知识库中做混合检索,返回最相关的原文片段(不做总结、不生成答案)
 
@@ -115,20 +149,32 @@ def search_knowledge_base(question: str, kb_name: str = "", top_n: int = 4) -> s
     :param question: 检索问题或关键词,尽量包含专有名词(型号、编号、指标名)以提升命中率
     :param kb_name: 知识库名称,留空则使用默认知识库
     :param top_n: 返回片段数量,默认 4
-    :return: 带来源编号和相似度的原文片段;检索不到或库不存在时返回中文提示
+    :param filter_json: 可选的元数据过滤,JSON 字符串,例如 {"部门": "风控"} 或 {"类型": ["制度", "规范"]}。
+        语义是"白名单":元数据缺该字段或取值不匹配的片段会被剔除;值为列表时命中其一即可。
+        可用字段先用 list_knowledge_bases 查看(每行末的"可过滤字段"),常见字段来自文档头部的
+        YAML frontmatter(如 部门/类型/密级/版本)以及系统字段 file/path/suffix。留空表示不过滤。
+    :return: 带来源编号和相似度的原文片段;检索不到、库不存在或过滤后为空时返回中文提示
     """
     monitor.report_tool(
         tool_name="自研RAG知识库检索工具：search_knowledge_base",
-        args={"question": question, "kb_name": kb_name, "top_n": top_n},
+        args={"question": question, "kb_name": kb_name, "top_n": top_n, "filter": filter_json},
     )
+
+    filter_spec, filter_error = _parse_tool_filter(filter_json)
+    if filter_error:
+        return filter_error
 
     try:
         pipeline = _open_pipeline_for_query(kb_name)
         if not len(pipeline.store):
             return f"知识库 {pipeline.kb} 是空的,没有可检索的文档。"
 
-        results = pipeline.search(question, top_n=max(1, min(int(top_n), 10)))
+        results = pipeline.search(
+            question, top_n=max(1, min(int(top_n), 10)), filter=filter_spec
+        )
         if not results:
+            if filter_spec:
+                return _filter_miss_message(pipeline.kb, filter_spec, pipeline)
             return "知识库中没有检索到相关内容。"
 
         # 门槛判定必须用 grounded_score()(向量余弦),而不是 results[0].score:
@@ -159,7 +205,7 @@ def search_knowledge_base(question: str, kb_name: str = "", top_n: int = 4) -> s
 
 
 @tool
-def ask_knowledge_base(question: str, kb_name: str = "") -> str:
+def ask_knowledge_base(question: str, kb_name: str = "", filter_json: str = "") -> str:
     """
     向企业内部知识库提问,直接返回带引用来源的答案(内部完成检索 + 大模型生成)
 
@@ -167,19 +213,28 @@ def ask_knowledge_base(question: str, kb_name: str = "") -> str:
     复杂问题建议改用 search_knowledge_base 分多轮检索,信息更可控。
     :param question: 用户问题
     :param kb_name: 知识库名称,留空则使用默认知识库
+    :param filter_json: 可选的元数据过滤,JSON 字符串,例如 {"部门": "风控"} 或 {"密级": ["公开", "内部"]}。
+        语义是"白名单":元数据缺该字段或取值不匹配的片段会被剔除;值为列表时命中其一即可。
+        可用字段见 list_knowledge_bases 返回的"可过滤字段"(多来自文档头部 YAML frontmatter)。
     :return: 答案 + 引用列表;无依据时明确说明知识库中没有相关资料
     """
     monitor.report_tool(
         tool_name="自研RAG知识库问答工具：ask_knowledge_base",
-        args={"question": question, "kb_name": kb_name},
+        args={"question": question, "kb_name": kb_name, "filter": filter_json},
     )
+
+    filter_spec, filter_error = _parse_tool_filter(filter_json)
+    if filter_error:
+        return filter_error
 
     try:
         pipeline = _open_pipeline_for_query(kb_name)
         if not len(pipeline.store):
             return f"知识库 {pipeline.kb} 是空的,没有可检索的文档。"
 
-        answer = pipeline.query(question)
+        answer = pipeline.query(question, filter=filter_spec)
+        if filter_spec and not answer.citations:
+            return _filter_miss_message(pipeline.kb, filter_spec, pipeline)
         lines = [answer.answer]
         if answer.citations:
             lines.append("")

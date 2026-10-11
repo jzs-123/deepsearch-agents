@@ -59,6 +59,9 @@ class VectorStore:
     chunks: list[Chunk] = field(default_factory=list)
     vectors: np.ndarray | None = None
     meta: dict = field(default_factory=dict)
+    # 数据版本号:库内 chunk 有任何增删改就 +1,落盘到 meta.json。
+    # 查询/生成缓存把版本号写进缓存键,从而实现「库一变,该库缓存整体失效」。
+    data_version: int = 0
     # 是否启用 faiss(若环境里恰好装了 faiss-cpu,用 IndexFlatIP 加速精确检索)
     use_faiss: bool = False
     _index: object | None = None
@@ -103,6 +106,7 @@ class VectorStore:
             self.meta = json.loads(meta_path.read_text(encoding="utf-8"))
             self.embedding_fingerprint = self.meta.get("embedding_fingerprint", "")
             self.dim = int(self.meta.get("dim", 0) or 0)
+            self.data_version = int(self.meta.get("data_version", 0) or 0)
 
     def _load_data(self) -> None:
         chunks_path = self.path / CHUNKS_FILE
@@ -183,6 +187,7 @@ class VectorStore:
                 "embedding_fingerprint": self.embedding_fingerprint,
                 "dim": int(self.dim),
                 "chunk_count": len(self.chunks),
+                "data_version": int(self.data_version),
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
         )
@@ -238,6 +243,8 @@ class VectorStore:
                     f"向量维度不一致:库内 {self.vectors.shape[1]},新增 {added.shape[1]}"
                 )
             self.vectors = np.vstack([self.vectors, added])
+        # 数据变了 → 版本号 +1(查询/生成缓存据此整体失效)
+        self.bump_version()
         logger.debug("知识库 %s 追加 %d 条(原有 %d 条)", self.path.name, len(new_chunks), existing_total)
         self._build_index()
         return len(new_chunks)
@@ -252,8 +259,14 @@ class VectorStore:
             self.chunks = [self.chunks[i] for i in keep]
             if self.vectors is not None and len(self.vectors):
                 self.vectors = self.vectors[keep]
+            self.bump_version()
             self._build_index()
         return removed
+
+    def bump_version(self) -> int:
+        """数据版本号 +1(任何 chunk 增删改都必须调用)。"""
+        self.data_version = int(self.data_version or 0) + 1
+        return self.data_version
 
     def clear(self) -> None:
         """清空知识库数据(保留目录)。"""
@@ -262,6 +275,7 @@ class VectorStore:
         self._index = None
         self.embedding_fingerprint = ""
         self.meta = {}
+        self.data_version = 0
 
     # ────────────────────────── 检索 ──────────────────────────
 
@@ -314,7 +328,10 @@ def list_knowledge_bases(data_dir: Path) -> list[dict]:
         return []
     result: list[dict] = []
     for item in sorted(data_dir.iterdir()):
-        if not item.is_dir():
+        if not item.is_dir() or item.name == ".audit":
+            # .audit 是审计目录,不是知识库(元数据/缓存目录同理按点开头跳过)
+            continue
+        if item.name.startswith("."):
             continue
         meta: dict = {}
         meta_path = item / META_FILE
@@ -337,6 +354,9 @@ def list_knowledge_bases(data_dir: Path) -> list[dict]:
                 "chunk_count": int(count),
                 "embedding": meta.get("embedding_fingerprint", ""),
                 "updated_at": meta.get("updated_at", ""),
+                "data_version": int(meta.get("data_version", 0) or 0),
+                # 可过滤字段清单(入库时自动汇总去重,见 app/rag/metadata.py)
+                "filter_fields": list(meta.get("filter_fields", []) or []),
                 "meta": meta,
             }
         )

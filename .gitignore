@@ -24,6 +24,12 @@ basetemp-probe.log
 tests/test_basetemp_probe.py
 # 成员调试时在仓库根留下的单字母日志(a.log … e.log 之类)
 /[a-e].log
+# 自研 RAG 的运行时产物：每个知识库的缓存目录与全局审计目录
+# （rag_data/ 本身已纳入版本控制，所以这里必须单独排除这两类"生成物"）
+rag_data/*/.cache/
+rag_data/.audit/
+# RAG_AUDIT_DIR 指到别处时也不会污染仓库
+.audit/
 
 # dependencies
 /node_modules
@@ -80,3 +86,6 @@ testem.log
 # System Files
 .DS_Store
 Thumbs.db
+
+# t14 探针残留(沙箱无法物理删除,忽略之)
+app/rag/_write_probe.py

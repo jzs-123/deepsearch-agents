@@ -20,16 +20,28 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+import numpy as np
+
+from app.rag.audit import AuditLogger, build_query_entry, build_search_entry
 from app.rag.bm25 import BM25Index
+from app.rag.cache import PipelineCache
 from app.rag.chunking import chunk_document
 from app.rag.config import RagConfig, load_rag_config
 from app.rag.embedding import Embedder, build_embedder
 from app.rag.generator import AnswerGenerator, ChatClient
 from app.rag.hybrid import hybrid_search, reciprocal_rank_fusion
 from app.rag.loaders import LoadedDocument, iter_supported_files, load_document
+from app.rag.metadata import (
+    apply_filter,
+    canonical_filter,
+    extract_metadata,
+    filter_fields_of,
+    format_filter_hint,
+    normalize_filter,
+)
 from app.rag.rerank import build_reranker
 from app.rag.rewrite import RewriteResult, build_rewriter
 from app.rag.types import Answer, Chunk, RetrievedChunk, content_fingerprint
@@ -39,6 +51,9 @@ logger = logging.getLogger(__name__)
 
 #: 多查询融合时,非原始查询的变体权重折扣(原始查询权重要略高,避免被变体挤掉)
 VARIANT_DISCOUNT = 0.85
+
+#: 查询缓存里最多缓存多少条结果(与 top_k 同量级即可,避免缓存文件无谓膨胀)
+MAX_CACHED_RESULTS = 50
 
 
 @dataclass
@@ -55,6 +70,8 @@ class IngestReport:
     elapsed: float = 0.0
     details: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # embedding 缓存的本次命中/未命中(缓存关闭时恒为 0/全量,便于对比"开没开缓存")
+    embedding_cache: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +83,7 @@ class IngestReport:
             "chunks_replaced": self.chunks_replaced,
             "total_chunks": self.total_chunks,
             "elapsed": round(self.elapsed, 3),
+            "embedding_cache": self.embedding_cache,
             "details": self.details,
             "warnings": self.warnings,
         }
@@ -112,6 +130,18 @@ class RagPipeline:
             embedding_fingerprint=self.embedder.fingerprint,
             create=create,
         )
+        # 缓存与审计都是"旁路":缓存默认关闭,审计默认开启但写入失败只 warning
+        self.cache = PipelineCache(
+            kb_dir=self.kb_dir,
+            fingerprint=self.embedder.fingerprint,
+            data_version=self.store.data_version,
+            enabled=self.config.cache_enabled,
+        )
+        self.audit = AuditLogger(
+            audit_dir=self.config.audit_path(self.kb),
+            kb=self.kb,
+            enabled=self.config.audit_enabled,
+        )
         # 切块参数变化时给出提示:旧 chunk 是按老参数切的,混用会导致检索质量下降
         old_size = self.store.meta.get("chunk_size")
         if old_size and int(old_size) != self.config.chunk_size:
@@ -157,6 +187,14 @@ class RagPipeline:
                 report.warnings.append(f"跳过 {file_path.name}:未解析出文本")
                 continue
 
+            # 元数据:文件级(名称/路径/后缀/修改时间/大小)+ 内容级(Markdown YAML frontmatter)。
+            # frontmatter 会从正文里剥掉——它是元数据,不是正文,留在正文里既污染检索也会挤占 chunk。
+            meta_result = extract_metadata(file_path, doc.text, base_dir=base_dir)
+            for warning in meta_result.warnings:
+                report.warnings.append(f"{file_path.name}:{warning}")
+            if meta_result.stripped:
+                doc = replace(doc, text=meta_result.body)
+
             chunks = chunk_document(
                 doc,
                 chunk_size=self.config.chunk_size,
@@ -166,6 +204,10 @@ class RagPipeline:
                 report.files_skipped += 1
                 report.warnings.append(f"跳过 {file_path.name}:切块结果为空")
                 continue
+
+            # 元数据挂到每个 chunk 上,随 chunks.jsonl 一起持久化
+            for chunk in chunks:
+                chunk.metadata = dict(meta_result.fields)
 
             # 整篇替换:同一 doc_id 的旧 chunk 先删掉
             replaced = self.store.delete_document(chunks[0].doc_id)
@@ -184,14 +226,24 @@ class RagPipeline:
                     # 文本来源(text_layer/ocr/mixed/none):排障时用于判断该文件的正文
                     # 是原文还是 OCR 识别结果(OCR 会带错字,见 docs/rag-ocr.md)
                     "extraction": doc.extraction,
+                    # 该文件携带的可过滤字段(frontmatter 字段名,便于入库时人工核对)
+                    "filter_fields": meta_result.filter_fields,
                 }
             )
             for warning in doc.warnings:
                 report.warnings.append(f"{file_path.name}:{warning}")
 
         if pending_chunks:
-            # 向量化是整批做一次:批量编码远快于逐条 encode
-            vectors = self.embedder.encode(pending_texts, is_query=False)
+            # 向量化是整批做一次:批量编码远快于逐条 encode;开了缓存则命中部分直接复用向量
+            hits_before = self.cache.stats.embedding_hits
+            misses_before = self.cache.stats.embedding_misses
+            vectors = self._encode_documents(pending_texts)
+            report.embedding_cache = {
+                "enabled": bool(self.cache.enabled),
+                "hits": self.cache.stats.embedding_hits - hits_before,
+                "misses": self.cache.stats.embedding_misses - misses_before,
+                "texts": len(pending_texts),
+            }
             report.chunks_added = self.store.add(
                 pending_chunks, vectors, embedding_fingerprint=self.embedder.fingerprint
             )
@@ -201,9 +253,13 @@ class RagPipeline:
                     "chunk_overlap": self.config.chunk_overlap,
                     "embedding_provider": self.config.embedding_provider,
                     "kb": self.kb,
+                    # 可过滤字段清单:自动去重,供 list/stats 与 Agent 工具展示
+                    "filter_fields": self.filter_fields,
                 }
             )
             self.store.save()
+            # 数据变了 → 查询/生成缓存整体失效(版本号已随 add/delete 递增)
+            self.cache.set_version(self.store.data_version)
             # 数据变了,BM25 索引必须失效重建,否则稀疏路会检索到已删除的旧文档
             self._bm25 = None
 
@@ -244,12 +300,14 @@ class RagPipeline:
             for offset, chunk in enumerate(chunked):
                 chunk.chunk_index = index * 1000 + offset
                 chunk.doc_id = content_fingerprint(combined)
+                # 手工写入的文本没有文件级元数据,只留来源(过滤时仍可按 path/file 用)
+                chunk.metadata = {"file": source, "path": source}
                 chunks.append(chunk)
         if not chunks:
             return 0
         # 与文件入库保持一致:先按 doc_id 清掉同一份文本的旧版本,避免重复写入
         self.store.delete_document(content_fingerprint(combined))
-        vectors = self.embedder.encode([c.text for c in chunks], is_query=False)
+        vectors = self._encode_documents([c.text for c in chunks])
         added = self.store.add(chunks, vectors, embedding_fingerprint=self.embedder.fingerprint)
         self.store.meta.update(
             {
@@ -257,11 +315,65 @@ class RagPipeline:
                 "chunk_overlap": self.config.chunk_overlap,
                 "embedding_provider": self.config.embedding_provider,
                 "kb": self.kb,
+                "filter_fields": self.filter_fields,
             }
         )
         self.store.save()
+        self.cache.set_version(self.store.data_version)
         self._bm25 = None
         return added
+
+    # ────────────────────────── 元数据 / 缓存 工具 ──────────────────────────
+
+    @property
+    def filter_fields(self) -> list[str]:
+        """该知识库当前可用的过滤字段(优先用 meta.json 里缓存的清单,缺失时现算)。"""
+        cached = self.store.meta.get("filter_fields")
+        if isinstance(cached, list) and cached:
+            return sorted({str(item) for item in cached})
+        return filter_fields_of(list(self.store.all_chunks()))
+
+    def _encode_documents(self, texts: list[str]) -> np.ndarray:
+        """文档向量化(带 embedding 缓存)。
+
+        缓存关闭时就是 `self.embedder.encode(texts)`,行为与引入缓存前完全一致;
+        开启时命中的文本直接复用向量,只对未命中的部分调用向量后端——这是入库最耗时的一块。
+        任何维度不一致都视为缓存不可用(降级为全量重算),不让脏缓存污染向量库。
+        """
+        if not texts:
+            return np.zeros((0, self.embedder.dim or 1), dtype=np.float32)
+        hits = self.cache.get_embeddings(texts)
+        if hits:
+            cached_dim = len(next(iter(hits.values())))
+            expected_dim = int(self.embedder.dim or cached_dim)
+            if expected_dim != cached_dim:
+                logger.warning(
+                    "embedding 缓存维度(%d)与当前后端(%d)不一致,已忽略缓存重新编码",
+                    cached_dim,
+                    expected_dim,
+                )
+                hits = {}
+        missing = [index for index in range(len(texts)) if index not in hits]
+        fresh: np.ndarray | None = None
+        if missing:
+            fresh = np.asarray(
+                self.embedder.encode([texts[index] for index in missing], is_query=False),
+                dtype=np.float32,
+            )
+            if fresh.ndim == 1:
+                fresh = fresh.reshape(1, -1)
+            self.cache.put_embeddings([texts[index] for index in missing], fresh)
+        if not hits:
+            return fresh if fresh is not None else np.zeros((0, self.embedder.dim or 1), dtype=np.float32)
+
+        dim = len(next(iter(hits.values())))
+        matrix = np.zeros((len(texts), dim), dtype=np.float32)
+        for index, vector in hits.items():
+            matrix[index] = np.asarray(vector, dtype=np.float32)
+        if fresh is not None:
+            for row, index in enumerate(missing):
+                matrix[index] = fresh[row]
+        return matrix
 
     # ────────────────────────── 检索 ──────────────────────────
 
@@ -421,16 +533,104 @@ class RagPipeline:
         top_k: int,
         top_n: int,
         use_rerank: bool,
+        normalized_filter: dict[str, list[str]] | None = None,
     ) -> tuple[list[RetrievedChunk], dict, float]:
-        """跑一轮「检索 → 重排」,返回 (最终结果, 检索审计信息, 最终判定分)。
+        """跑一轮「检索 → (元数据过滤) → 重排」,返回 (最终结果, 检索审计信息, 最终判定分)。
 
         判定分取的是**最终结果的** `grounded_score()`(向量余弦)。这一点很关键:
         重排前候选按 RRF 排、重排后按词面分排,若拿重排前的候选算分,审计里就会出现
         「重试判定分 0.1541,而实际用的是 0.2181」这种对不上账的情况(本项目真实踩到,已修)。
+
+        元数据过滤插在「召回之后、重排之前」:先按范围剔除候选,再让重排把名额花在可用的片段上
+        (见 app/rag/metadata.py 顶部的说明)。
         """
         candidates, info = self._retrieve_variants(variants, top_k)
+        before = len(candidates)
+        if normalized_filter:
+            candidates = apply_filter(candidates, normalized_filter)
+        info = dict(info)
+        info["filtered_out"] = before - len(candidates)
+        info["pre_filter_count"] = before
         results = self._apply_rerank(candidates, variants, top_n, use_rerank)
         return results, info, self.grounded_score(results)
+
+    # ── 结果序列化(查询缓存用) ──
+
+    @staticmethod
+    def _serialize_results(results: list[RetrievedChunk]) -> list[dict]:
+        return [
+            {
+                "chunk_id": item.chunk.chunk_id,
+                "rank": item.rank,
+                "score": float(item.score),
+                "dense_score": None if item.dense_score is None else float(item.dense_score),
+                "sparse_score": None if item.sparse_score is None else float(item.sparse_score),
+                "rrf_score": float(item.rrf_score),
+                "channels": list(item.channels),
+            }
+            for item in results[:MAX_CACHED_RESULTS]
+        ]
+
+    def _restore_results(self, payload: list[dict]) -> list[RetrievedChunk] | None:
+        """从缓存载荷还原结果;任何一条 chunk 已不存在(库变过)就视为缓存不可用。"""
+        index = {chunk.chunk_id: chunk for chunk in self.store.all_chunks()}
+        restored: list[RetrievedChunk] = []
+        for row in payload:
+            chunk = index.get(str(row.get("chunk_id")))
+            if chunk is None:
+                logger.info("查询缓存命中但 chunk 已不存在,按未命处理:%s", row.get("chunk_id"))
+                return None
+            restored.append(
+                RetrievedChunk(
+                    chunk=chunk,
+                    score=float(row.get("score", 0.0)),
+                    dense_score=row.get("dense_score"),
+                    sparse_score=row.get("sparse_score"),
+                    rrf_score=float(row.get("rrf_score", 0.0)),
+                    rank=int(row.get("rank", 0) or 0),
+                    channels=list(row.get("channels") or []),
+                    cached=True,
+                )
+            )
+        return restored
+
+    def _results_summary(self, results: list[RetrievedChunk]) -> list[dict]:
+        """可审计的结果摘要(不含原文;与 audit.summarize_results 同字段)。"""
+        return [
+            {
+                "rank": item.rank,
+                "chunk_id": item.chunk.chunk_id,
+                "source": item.chunk.source,
+                "chunk_index": item.chunk.chunk_index,
+                "channels": list(item.channels),
+                "score": round(item.score, 4),
+                "dense": None if item.dense_score is None else round(item.dense_score, 4),
+                "sparse": None if item.sparse_score is None else round(item.sparse_score, 4),
+                "rrf": round(item.rrf_score, 4),
+                "cached": bool(item.cached),
+            }
+            for item in results
+        ]
+
+    def _record_search_audit(
+        self,
+        question: str,
+        results: list[RetrievedChunk],
+        cache_info: dict | None,
+        kind: str = "search",
+    ) -> None:
+        """写一条审计记录;失败只 warning(审计是旁路,不能拖垮查询)。"""
+        entry = build_search_entry(
+            question=question,
+            debug=self.last_search_debug,
+            filter_spec=self.last_search_debug.get("filter") or {},
+            fingerprint=self.embedder.fingerprint,
+            results=results,
+            cache_info=cache_info,
+            audit_dir=str(self.audit.audit_dir),
+        )
+        entry["kind"] = kind
+        self.audit.record(entry)
 
     def search(
         self,
@@ -439,14 +639,24 @@ class RagPipeline:
         top_n: int | None = None,
         rerank: bool | None = None,
         rewrite: bool | None = None,
+        filter: dict | None = None,
+        _record_audit: bool = True,
     ) -> list[RetrievedChunk]:
-        """混合检索 + 重排,返回最终 top_n 结果。
+        """混合检索 + 元数据过滤 + 重排,返回最终 top_n 结果。
 
         :param rewrite: None=按配置(默认 local,低分时自动重试);False=强制关闭(历史行为);
             True=首轮就多查询(不等低分)
+        :param filter: 元数据过滤,如 `{"部门": "风控"}` / `{"类型": ["制度", "规范"]}`;
+            缺字段或值不匹配的片段会被剔除(白名单语义),过滤发生在召回之后、重排之前
+        :param _record_audit: 内部参数。`query()` 会自己写一条包含生成阶段的审计记录,
+            因此调用 search 时把它置 False,避免一次问答产生两条日志
         """
         top_k = top_k or self.config.top_k
         top_n = top_n or self.config.top_n
+        normalized_filter = normalize_filter(filter)
+        filter_spec = {str(key): value for key, value in (filter or {}).items()}
+        available_fields = self.filter_fields
+
         if not len(self.store):
             self.last_search_debug = {
                 "question": question,
@@ -454,12 +664,55 @@ class RagPipeline:
                 "empty_store": True,
                 "variants": [],
                 "retry": {"enabled": bool(self.config.retry_on_low_score), "triggered": False},
+                "filter": filter_spec,
+                "filter_fields": available_fields,
+                "filtered_out": 0,
+                "cache": {"used": bool(self.cache.enabled), "type": "query", "hit": False},
+                "cached": False,
                 "results": [],
             }
+            if _record_audit:
+                self._record_search_audit(question, [], self.last_search_debug["cache"])
             return []
 
         mode = self._resolve_rewrite_mode(rewrite)
         use_rerank = (self.config.rerank_mode != "off") if rerank is None else rerank
+
+        # ── 查询结果缓存:命中则直接返回缓存结果(并显式标注 cached=True) ──
+        cache_key, cached_payload = self.cache.get_query(question, canonical_filter(filter), top_n)
+        cache_info = {
+            "used": bool(self.cache.enabled),
+            "type": "query",
+            "hit": False,
+            "key": cache_key,
+            "data_version": self.store.data_version,
+        }
+        if cached_payload is not None:
+            restored = self._restore_results(cached_payload.get("results") or [])
+            if restored is not None:
+                cache_info["hit"] = True
+                self.last_search_debug = {
+                    "question": question,
+                    "rewrite_mode": cached_payload.get("rewrite_mode", mode),
+                    "variants": cached_payload.get("variants") or [question],
+                    "variant_count": len(cached_payload.get("variants") or [question]),
+                    "variant_hits": cached_payload.get("variant_hits", []),
+                    "fused_count": cached_payload.get("fused_count"),
+                    "gate_score": cached_payload.get("gate_score"),
+                    "retry": cached_payload.get("retry") or {"enabled": False, "triggered": False},
+                    "rewrite": cached_payload.get("rewrite"),
+                    "rerank": cached_payload.get("rerank", use_rerank),
+                    "filter": filter_spec,
+                    "filter_fields": available_fields,
+                    "filtered_out": cached_payload.get("filtered_out", 0),
+                    "cache": cache_info,
+                    "cached": True,
+                    "results": self._results_summary(restored),
+                }
+                if _record_audit:
+                    self._record_search_audit(question, restored, cache_info)
+                return restored
+
         rewrite_result: RewriteResult | None = None
         retry: dict = {
             "enabled": bool(self.config.retry_on_low_score) and mode != "off",
@@ -472,7 +725,7 @@ class RagPipeline:
             rewrite_result = self._rewriter(mode).rewrite_detailed(question)
             used_variants = rewrite_result.variants
             results, search_info, gate = self._search_once(
-                used_variants, top_k, top_n, use_rerank
+                used_variants, top_k, top_n, use_rerank, normalized_filter
             )
             retry["gate_before"] = round(gate, 4)
             retry["reason"] = "首轮即改写,无需重试"
@@ -480,7 +733,7 @@ class RagPipeline:
             # 首轮:只用原始查询(与改写功能引入前的路径一致)
             used_variants = [question]
             results, search_info, gate_before = self._search_once(
-                used_variants, top_k, top_n, use_rerank
+                used_variants, top_k, top_n, use_rerank, normalized_filter
             )
             retry["gate_before"] = round(gate_before, 4)
 
@@ -490,7 +743,7 @@ class RagPipeline:
                 retry_variants = rewrite_result.variants
                 if len(retry_variants) > 1:
                     retry_results, retry_info, gate_after = self._search_once(
-                        retry_variants, top_k, top_n, use_rerank
+                        retry_variants, top_k, top_n, use_rerank, normalized_filter
                     )
                     retry.update(
                         triggered=True,
@@ -516,20 +769,36 @@ class RagPipeline:
             "retry": retry,
             "rewrite": rewrite_result.to_dict() if rewrite_result else None,
             "rerank": bool(use_rerank),
-            "results": [
-                {
-                    "rank": item.rank,
-                    "source": item.chunk.source,
-                    "chunk_index": item.chunk.chunk_index,
-                    "channels": list(item.channels),
-                    "score": round(item.score, 4),
-                    "dense": None if item.dense_score is None else round(item.dense_score, 4),
-                    "sparse": None if item.sparse_score is None else round(item.sparse_score, 4),
-                    "rrf": round(item.rrf_score, 4),
-                }
-                for item in results
-            ],
+            "filter": filter_spec,
+            "filter_fields": available_fields,
+            "filtered_out": search_info.get("filtered_out", 0),
+            "filtered_empty": bool(normalized_filter) and not results,
+            "cache": cache_info,
+            "cached": False,
+            "results": self._results_summary(results),
         }
+        # 写查询缓存(数据版本号已写进键里,库一变就整体失效)
+        if self.cache.enabled:
+            self.cache.put_query(
+                question,
+                canonical_filter(filter),
+                {
+                    "results": self._serialize_results(results),
+                    "variants": list(used_variants),
+                    "variant_hits": search_info.get("variant_hits", []),
+                    "fused_count": search_info.get("fused_count"),
+                    "gate_score": self.last_search_debug["gate_score"],
+                    "retry": retry,
+                    "rewrite": rewrite_result.to_dict() if rewrite_result else None,
+                    "rewrite_mode": mode,
+                    "rerank": bool(use_rerank),
+                    "filtered_out": search_info.get("filtered_out", 0),
+                    "data_version": self.store.data_version,
+                },
+                top_n=top_n,
+            )
+        if _record_audit:
+            self._record_search_audit(question, results, cache_info)
         return results
 
     @staticmethod
@@ -560,13 +829,67 @@ class RagPipeline:
         )
         return client if client.available else None
 
-    def query(self, question: str, top_k: int | None = None, top_n: int | None = None) -> Answer:
-        """检索 + 生成,返回带引用的完整答案。"""
+    def query(
+        self,
+        question: str,
+        top_k: int | None = None,
+        top_n: int | None = None,
+        filter: dict | None = None,
+    ) -> Answer:
+        """检索 + 生成,返回带引用的完整答案。
+
+        :param filter: 元数据过滤,直接透传给 `search()`(见 metadata.py 的匹配规则)
+        """
         started = time.time()
-        chunks = self.search(question, top_k=top_k, top_n=top_n)
-        answer = AnswerGenerator(
-            client=self._llm_client(), min_score=self.config.min_score
-        ).generate(question, chunks, gate_score=self.grounded_score(chunks))
+        chunks = self.search(question, top_k=top_k, top_n=top_n, filter=filter, _record_audit=False)
+        filter_spec = {str(key): value for key, value in (filter or {}).items()}
+        canonical = canonical_filter(filter)
+
+        llm_called = False
+        cache_info = {
+            "used": bool(self.cache.enabled),
+            "type": "generation",
+            "hit": False,
+            "key": "",
+            "data_version": self.store.data_version,
+        }
+
+        # ── 生成结果缓存:命中则跳过整次大模型调用 ──
+        chunk_ids = [item.chunk.chunk_id for item in chunks]
+        gen_key, cached_answer = self.cache.get_generation(
+            question, canonical, chunk_ids, self.config.llm_model
+        )
+        cache_info["key"] = gen_key
+        answer: Answer | None = None
+        if cached_answer is not None:
+            try:
+                answer = Answer(
+                    question=cached_answer.get("question", question),
+                    answer=cached_answer.get("answer", ""),
+                    citations=list(cached_answer.get("citations") or []),
+                    contexts=list(cached_answer.get("contexts") or []),
+                    grounded=bool(cached_answer.get("grounded", False)),
+                    debug=dict(cached_answer.get("debug") or {}),
+                )
+                cache_info["hit"] = True
+            except Exception as exc:  # noqa: BLE001 - 缓存内容坏掉就当未命中
+                logger.warning("生成缓存载荷无法还原(按未命处理):%s", exc)
+                answer = None
+
+        if answer is None:
+            llm_called = self._llm_client() is not None
+            answer = AnswerGenerator(
+                client=self._llm_client(), min_score=self.config.min_score
+            ).generate(question, chunks, gate_score=self.grounded_score(chunks))
+            if self.cache.enabled and answer.answer:
+                self.cache.put_generation(
+                    question,
+                    canonical,
+                    chunk_ids,
+                    self.config.llm_model,
+                    answer.to_dict(),
+                )
+
         answer.debug["elapsed"] = round(time.time() - started, 3)
         # 把改写/重试的审计信息一并带出:只有能看到"改了什么、有没有重试",才谈得上调参
         debug = self.last_search_debug
@@ -575,18 +898,49 @@ class RagPipeline:
         answer.debug["retry_triggered"] = bool(debug.get("retry", {}).get("triggered"))
         if debug.get("retry", {}).get("gate_before") is not None:
             answer.debug["gate_before"] = debug["retry"]["gate_before"]
+        # 元数据过滤与缓存同样要可见:过滤掉了多少、有没有命中缓存
+        answer.debug["filter"] = filter_spec
+        answer.debug["filtered_out"] = debug.get("filtered_out", 0)
+        answer.debug["filter_fields"] = debug.get("filter_fields", [])
+        answer.debug["cache_hit"] = bool(cache_info.get("hit"))
+        answer.debug["cache_type"] = cache_info.get("type")
+        if cache_info.get("hit"):
+            answer.debug["cached"] = True
+            answer.debug["contexts"] = answer.contexts
+
+        # 一次问答只写一条审计(检索 + 生成合并),避免同一次 query 产生两条日志
+        entry = build_query_entry(
+            search_entry=build_search_entry(
+                question=question,
+                debug=debug,
+                filter_spec=filter_spec,
+                fingerprint=self.embedder.fingerprint,
+                results=chunks,
+                cache_info=cache_info,
+                audit_dir=str(self.audit.audit_dir),
+            ),
+            answer=answer,
+            llm_called=llm_called,
+            elapsed=answer.debug["elapsed"],
+            cache_info=cache_info,
+        )
+        self.audit.record(entry)
         return answer
 
     # ────────────────────────── 运维 ──────────────────────────
 
     def reset(self) -> None:
-        """清空当前知识库(删除所有 chunk 与向量,保留目录)。"""
+        """清空当前知识库(删除所有 chunk 与向量,保留目录);缓存一起清掉。"""
         self.store.clear()
         # 写回一个空库:直接删除文件比留空 meta 更干净
         for name in ("chunks.jsonl", "vectors.npy", "meta.json"):
             target = self.kb_dir / name
             if target.exists():
                 target.unlink()
+        # 缓存必须跟着失效:embedding 缓存虽然内容寻址,但 reset 后库里已经没有对应向量,
+        # 留着只会让缓存文件与数据不一致(下次入库会重建)
+        self.cache.clear()
+        self.cache.set_version(0)
         self._bm25 = None
 
     def stats(self) -> dict:
@@ -604,6 +958,13 @@ class RagPipeline:
             "query_rewrite": self.config.query_rewrite,
             "query_variants": self.config.query_variants,
             "retry_on_low_score": self.config.retry_on_low_score,
+            # 企业级三项能力的状态(便于 `stats` / Agent 工具一眼看到是否生效)
+            "data_version": self.store.data_version,
+            "filter_fields": self.filter_fields,
+            "cache_enabled": self.config.cache_enabled,
+            "cache": self.cache.describe(),
+            "audit_enabled": self.config.audit_enabled,
+            "audit": self.audit.describe(),
         }
 
 
@@ -654,6 +1015,17 @@ def format_search_audit(debug: dict | None) -> str:
         )
     elif rewrite.get("llm_error"):
         lines.append(f"  · 大模型改写:失败→已降级为本地规则({rewrite.get('llm_error')})")
+    if debug.get("filter"):
+        lines.append(
+            f"  · 元数据过滤:{debug['filter']}"
+            f"(过滤掉 {debug.get('filtered_out', 0)} 条候选)"
+        )
+    cache = debug.get("cache") or {}
+    if cache.get("used"):
+        lines.append(
+            f"  · 缓存:{cache.get('type')} {'命中' if cache.get('hit') else '未命中'}"
+            f"(数据版本 {cache.get('data_version')})"
+        )
     return "\n".join(lines)
 
 
@@ -675,6 +1047,8 @@ def get_pipeline(
         config.embedding_provider,
         config.embedding_model,
         config.chunk_size,
+        config.cache_enabled,
+        config.audit_enabled,
         create,
         id(embedder),
     )
