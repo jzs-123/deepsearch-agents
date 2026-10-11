@@ -19,6 +19,7 @@ from app.rag.rewrite import REWRITE_MODES
 # 合法取值枚举,便于 CLI 直接校验用户输入
 EMBEDDING_PROVIDERS = ("local", "openai", "hash")
 RERANK_MODES = ("lexical", "llm", "off")
+VECTORSTORE_BACKENDS = ("numpy", "qdrant")
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,14 @@ class RagConfig:
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
     embedding_dim: int = 512
     embedding_device: str = "auto"
+
+    # 向量存储后端
+    # numpy = 全量内存 + 磁盘持久化(默认,零依赖,万级规模足够快);
+    # qdrant = Qdrant 本地嵌入模式或远程 server(十万级以上 / 需要过滤与并发管理时换)。
+    # 换后端**必须重新入库**:不同后端之间不自动迁移,且向量指纹校验会拦住不匹配的情况。
+    vectorstore: str = "numpy"
+    # qdrant 远程 server 地址;留空 = 本地嵌入模式(<kb>/qdrant/)
+    qdrant_url: str = ""
 
     # 切块
     chunk_size: int = 500
@@ -114,6 +123,10 @@ class RagConfig:
             )
         if self.ocr_min_text_chars < 0:
             raise ValueError("ocr_min_text_chars 不能为负数(0 表示关闭页级 OCR)")
+        if self.vectorstore not in VECTORSTORE_BACKENDS:
+            raise ValueError(
+                f"vectorstore 必须是 {VECTORSTORE_BACKENDS} 之一,当前为 {self.vectorstore!r}"
+            )
 
     def ocr_options(self) -> OcrOptions:
         """转成 OCR 层使用的选项对象(loaders 只认 OcrOptions,不反向依赖 RagConfig)。"""
@@ -161,6 +174,8 @@ def load_rag_config(**overrides) -> RagConfig:
         embedding_model=settings.rag_embedding_model,
         embedding_dim=settings.rag_embedding_dim,
         embedding_device=settings.rag_embedding_device,
+        vectorstore=settings.rag_vectorstore,
+        qdrant_url=settings.rag_qdrant_url,
         chunk_size=settings.rag_chunk_size,
         chunk_overlap=settings.rag_chunk_overlap,
         top_k=settings.rag_top_k,
@@ -195,4 +210,10 @@ def ensure_within(base: Path, target: Path) -> Path:
     return target_resolved
 
 
-__all__ = ["RagConfig", "load_rag_config", "ensure_within", "PROJECT_ROOT"]
+__all__ = [
+    "RagConfig",
+    "load_rag_config",
+    "ensure_within",
+    "PROJECT_ROOT",
+    "VECTORSTORE_BACKENDS",
+]

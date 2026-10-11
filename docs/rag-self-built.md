@@ -80,7 +80,8 @@ app/rag/
 ├── _powershell.py  WinRT 调用层（渲染与 OCR 共用，-EncodedCommand + 文件兜底）
 ├── chunking.py     切块：结构优先 + 长度兜底 + 重叠
 ├── embedding.py    向量化：local / openai / hash 三后端
-├── vectorstore.py  向量库：持久化 + 余弦检索 + 指纹校验
+├── vectorstore.py  向量库：持久化 + 余弦检索 + 指纹校验（numpy 后端，默认）
+├── qdrant_store.py 向量库：Qdrant 后端（本地嵌入 / 远程 server，可插拔，与 VectorStore 同接口）
 ├── bm25.py         稀疏检索：jieba 分词 + BM25 倒排索引
 ├── hybrid.py       混合检索：RRF 融合
 ├── rerank.py       重排：词面 / 大模型列表式
@@ -166,6 +167,8 @@ $env:PYTHONPATH='.uv-cache/pytest-deps'; python -m pytest tests -q
 | `RAG_DATA_DIR` | `rag_data` | 知识库数据根目录，每个子目录是一个知识库 |
 | `RAG_EMBEDDING_PROVIDER` | `local` | `local` / `openai` / `hash`；本地模型不可用会自动降级到 hash |
 | `RAG_EMBEDDING_MODEL` | `BAAI/bge-small-zh-v1.5` | 中文效果与体积平衡最好的一档 |
+| `RAG_VECTORSTORE` | `numpy` | `numpy` / `qdrant`；向量存储后端（换后端必须重入库） |
+| `RAG_QDRANT_URL` | 空 | Qdrant 远程地址；空 = 本地嵌入模式 |
 | `RAG_CHUNK_SIZE` | `500` | 单片段目标字符数 |
 | `RAG_CHUNK_OVERLAP` | `80` | 相邻片段重叠字符数 |
 | `RAG_TOP_K` / `RAG_TOP_N` | `10` / `4` | 粗排候选数 / 精排后送入大模型的条数 |

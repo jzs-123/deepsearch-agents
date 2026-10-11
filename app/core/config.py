@@ -74,6 +74,12 @@ class Settings(BaseSettings):
     rag_rrf_k: int = 60
     # 低于该相似度视为「知识库中没有依据」,直接拒答而不是让模型编造
     rag_min_score: float = 0.2
+    # ─── 自研 RAG:向量存储后端 ─────────────────────────────
+    # numpy(默认,零依赖,全量内存+磁盘持久化,万级规模够快) / qdrant(本地嵌入或远程 server)
+    # 换后端必须重新入库(不同后端不自动迁移,向量指纹校验会拦住不匹配)。
+    rag_vectorstore: str = "numpy"
+    # qdrant 远程 server 地址;留空 = 本地嵌入模式(数据落在 <kb>/qdrant/)
+    rag_qdrant_url: str = ""
     # ─── 自研 RAG:查询改写(Query Rewrite) ────────────────
     # off(关闭) / local(本地规则,零成本) / llm(大模型,失败降级本地) / local+llm(两级都用)
     # 应用级默认 local:CLI 与 Agent 工具都经 load_rag_config() 读配置,所以默认开启改写。

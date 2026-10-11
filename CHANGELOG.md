@@ -4,6 +4,17 @@
 
 ---
 
+## 2026-10-10 · 向量存储可插拔（numpy → Qdrant）
+
+- 新增 `app/rag/qdrant_store.py::QdrantStore`：实现与 `VectorStore` 相同接口，支持**本地嵌入模式**（`QdrantClient(path=...)`）与**远程 server**（`url=...`）。
+- 关键设计：存自己算好的向量（`Distance.COSINE`）、sidecar `meta.json` 复用（指纹/版本号/过滤字段零改动）、每知识库独立存储目录、numpy 保留为默认 + golden baseline。
+- 配置：`RAG_VECTORSTORE=numpy|qdrant`、`RAG_QDRANT_URL`（空 = 本地）。换后端必须重新入库。
+- 测试：`tests/test_qdrant_store.py`（mock 假 client，10 用例，验证幂等/指纹/删除/检索/版本号）。
+- 文档：`docs/rag-vectorstore.md`（安装、切换、对拍验证、限制）。
+- 全量回归：`pytest tests -q` → 526 passed；`selftest` 18/0。
+
+---
+
 ## 2026-10-10 · 企业级能力批次（OCR / 查询改写 / 元数据 / 缓存 / 审计 / RAGAS）
 
 ### 新增功能

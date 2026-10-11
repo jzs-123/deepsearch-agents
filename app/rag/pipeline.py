@@ -45,7 +45,7 @@ from app.rag.metadata import (
 from app.rag.rerank import build_reranker
 from app.rag.rewrite import RewriteResult, build_rewriter
 from app.rag.types import Answer, Chunk, RetrievedChunk, content_fingerprint
-from app.rag.vectorstore import EmbeddingMismatchError, VectorStore
+from app.rag.vectorstore import EmbeddingMismatchError, open_vectorstore
 
 logger = logging.getLogger(__name__)
 
@@ -125,10 +125,12 @@ class RagPipeline:
             allow_fallback=allow_embedding_fallback,
         )
 
-        self.store = VectorStore.open(
+        self.store = open_vectorstore(
+            self.config.vectorstore,
             self.kb_dir,
             embedding_fingerprint=self.embedder.fingerprint,
             create=create,
+            qdrant_url=self.config.qdrant_url,
         )
         # 缓存与审计都是"旁路":缓存默认关闭,审计默认开启但写入失败只 warning
         self.cache = PipelineCache(

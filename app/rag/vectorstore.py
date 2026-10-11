@@ -368,7 +368,41 @@ __all__ = [
     "SearchHit",
     "EmbeddingMismatchError",
     "list_knowledge_bases",
+    "open_vectorstore",
     "CHUNKS_FILE",
     "VECTORS_FILE",
     "META_FILE",
 ]
+
+
+def open_vectorstore(
+    backend: str,
+    path: Path,
+    embedding_fingerprint: str | None = None,
+    create: bool = False,
+    qdrant_url: str = "",
+):
+    """按后端打开向量存储（可插拔工厂）。
+
+    :param backend: "numpy" | "qdrant"
+    其余参数见 VectorStore.open / QdrantStore.open。
+    numpy 是默认与 golden baseline；qdrant 在需要十万级以上规模或远程 server 时启用。
+    """
+    backend = (backend or "numpy").lower()
+    if backend == "qdrant":
+        # 懒加载：只有真用到 qdrant 时才 import，numpy 默认路径不依赖 qdrant-client
+        from app.rag.qdrant_store import QdrantStore
+
+        return QdrantStore.open(
+            path,
+            embedding_fingerprint=embedding_fingerprint,
+            create=create,
+            url=qdrant_url,
+        )
+    if backend == "numpy":
+        return VectorStore.open(
+            path,
+            embedding_fingerprint=embedding_fingerprint,
+            create=create,
+        )
+    raise ValueError(f"未知的向量存储后端 {backend!r},可选:numpy / qdrant")
