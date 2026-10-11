@@ -17,6 +17,8 @@ app/updated
 tmpdir/
 .uv-cache/
 .agent-teams/
+# qdrant 本地模式的临时目录（sanity check / 对拍验证时建的，不进入仓库）
+tmp_qdrant_check/
 # 沙箱可写性探针：由子进程无法删除（docs/ 对子进程只读），保留作为环境限制的活体证据
 docs/__envi_write_probe.md
 # 成员的临时探针与日志，不应进入仓库
