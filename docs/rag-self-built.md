@@ -1,8 +1,9 @@
 # 自研 RAG 系统：从 RAGFlow 迁移到自建检索增强链路
 
-> 版本：MVP v1.0
+> 版本：企业级能力批次（MVP 之上新增 OCR / 查询改写 / 元数据过滤 / 缓存 / 审计 / RAGAS 评测）
 > 代码位置：`app/rag/`（检索引擎）、`app/tools/rag_tools.py`（Agent 工具层）
 > 文档目的：说明为什么自研、怎么实现、踩了哪些坑、还有哪些没解决
+> 专题文档：`rag-ocr.md`、`rag-query-rewrite.md`、`rag-enterprise-features.md`、`rag-eval-guide.md`、`rag-testing-guide.md`、`rag-upload-and-ask-guide.md`
 
 ---
 
@@ -40,23 +41,28 @@
                 app/rag 自研流水线（解析 → 切块 → 向量化 → 存储 → 混合检索 → 重排 → 生成）
 ```
 
-### 1.3 MVP 功能边界
+### 1.3 功能边界
 
 **已实现**：
 
-- 多格式文档解析：`.pdf` / `.docx` / `.md` / `.txt` / `.csv`
-- 结构感知切块（标题识别 + 段落/句子/硬切三级降级 + 重叠窗口）
+- 多格式文档解析：`.pdf` / `.docx` / `.md` / `.txt` / `.csv` / 图片（`.png`/`.jpg`/`.jpeg`/`.bmp`/`.webp`/`.tif`/`.tiff`）
+- **OCR**：扫描件 PDF 页转图识别、图片直接识别（Windows 内置引擎，零依赖；可插拔 rapidocr/tesseract）
+- 结构感知切块（标题识别 + 段落/句子/硬切三级降级 + 重叠窗口 + 标题路径）
 - 向量化：本地 BGE 中文模型 / OpenAI 兼容接口 / 离线 hash 兜底（三选一，自动降级）
-- 向量库持久化（numpy 全量精确检索，装了 faiss 自动加速）
+- 向量库持久化（numpy 全量精确检索，装了 faiss 自动加速）+ 向量指纹校验
 - 中文 BM25 稀疏检索（jieba 分词 + 倒排索引）
 - 混合检索：稠密 + 稀疏 **RRF 融合**
 - 重排：词面重排 / 大模型列表式重排 / 关闭（三选一）
+- **查询改写**：本地规则（口语归一化 + 同义词扩展 + 专有名词强化）+ 大模型变体，多查询 RRF 融合 + 低分自动重试
+- **元数据过滤**：文件级 + Markdown YAML frontmatter 自动抽取，召回后白名单过滤（等值/列表/AND）
+- **缓存**：embedding / 查询结果 / 生成结果三级，键含向量指纹 + 数据版本号（默认关闭）
+- **审计日志**：JSONL 追加写，含 query/filter/改写/缓存/重试/结果摘要（不含原文），可读回
 - 生成：强制引用、强制只用资料、检索无依据直接拒答
-- CLI：`list` / `create` / `ingest` / `search` / `ask` / `eval` / `stats` / `reset`
-- 检索质量评测（Hit@k / MRR / Recall@k / 拒答准确率）
-- 离线自测脚本：`python -m app.rag.selftest`（18 项断言全通过）
+- CLI：`list` / `create` / `ingest` / `search` / `ask` / `eval` / `stats` / `reset` / `audit`
+- 检索质量评测（Hit@k / MRR / Recall@k / 拒答准确率）+ **RAGAS 生成质量评测**（脚本 + 零依赖离线替代）
+- 离线自测脚本 + pytest 测试套件（**516 用例**）
 
-**明确不做**（留给下一版）：OCR、多轮对话改写、权限隔离、ANN 索引、生成质量评测。
+**未实现**（下一步候选）：权限/租户隔离、ANN 索引（十万级）、增量索引、上下文压缩、表格结构化检索、真实 BGE 语义向量验证与阈值重标定。
 
 ---
 
@@ -68,16 +74,26 @@
 app/rag/
 ├── types.py        数据模型：Chunk / RetrievedChunk / Answer
 ├── config.py       配置装配与校验（从 Settings 映射，可覆写）
-├── loaders.py      文档解析：多格式 → 带结构信息的纯文本
+├── loaders.py      文档解析：多格式 → 带结构信息的纯文本；图片/扫描件走 OCR
+├── ocr.py          OCR：Windows 内置 / RapidOcr / None 三后端，可插拔
+├── render.py       PDF 页渲染（Windows.Data.Pdf），与 OCR 解耦
+├── _powershell.py  WinRT 调用层（渲染与 OCR 共用，-EncodedCommand + 文件兜底）
 ├── chunking.py     切块：结构优先 + 长度兜底 + 重叠
 ├── embedding.py    向量化：local / openai / hash 三后端
 ├── vectorstore.py  向量库：持久化 + 余弦检索 + 指纹校验
 ├── bm25.py         稀疏检索：jieba 分词 + BM25 倒排索引
 ├── hybrid.py       混合检索：RRF 融合
 ├── rerank.py       重排：词面 / 大模型列表式
+├── rewrite.py      查询改写：本地规则 + 大模型变体
+├── metadata.py     元数据：文件级 + frontmatter 抽取 + 过滤匹配
+├── cache.py        缓存：embedding / 查询 / 生成三级
+├── audit.py        审计：JSONL 追加写 + 读回
 ├── generator.py    生成：上下文拼装 + 引用 + 拒答
-├── pipeline.py     编排：ingest / search / query
-├── eval.py         评测：Hit@k / MRR / Recall@k / 拒答率
+├── pipeline.py     编排：ingest / search / query（改写、过滤、缓存、审计都在这里串）
+├── eval.py         检索评测：Hit@k / MRR / Recall@k / 拒答率
+├── eval_ragas.py   RAGAS 生成质量评测（组装层）
+├── eval_offline.py 零依赖离线近似评测
+├── vendor.py       pip 不可用时的 vendor/ 依赖兜底
 ├── cli.py          命令行入口
 └── selftest.py     离线自测（不依赖大模型与向量模型）
 ```
@@ -97,12 +113,17 @@ app/rag/
 
 ```
 问题
+ ├─ 查询改写：本地规则 + 大模型变体（原始查询永远排第一）
+ ├─ 查询缓存：命中则直接返回（标注 cached=True）
  ├─ 稠密路：embed(query) → 向量库余弦 Top-K
  ├─ 稀疏路：jieba 分词 → BM25 Top-K
  ├─ RRF 融合：score = Σ w_c / (k + rank_c)，k=60，w_dense=1.0，w_sparse=0.8
- └─ 重排：Top-K → Top-N（词面重排 / 大模型列表式）
+ ├─ 元数据过滤：召回后、重排前做白名单过滤
+ ├─ 重排：Top-K → Top-N（词面重排 / 大模型列表式）
+ └─ 低分重试：判定分（向量余弦）低于阈值 → 用改写变体重试
  → 生成：拼上下文（带 [编号]）→ 大模型 → 答案 + 引用
  → 拒答门槛：向量余弦 < min_score 直接拒答，不进入生成
+ → 审计：整条链路写一条 JSONL（不含原文）
 ```
 
 ---
@@ -125,8 +146,17 @@ python -m app.rag.cli ask -k default -q "风控策略有哪些要求"
 # 5) 评测检索质量（-n 指定 top-k，--no-rerank 可开关重排做 A/B）
 python -m app.rag.cli eval -k default -e examples/rag_eval_set.json -n 5
 
-# 6) 离线自测（不需要大模型和向量模型，验证整条链路）
+# 6) 元数据过滤（文档头写 YAML frontmatter，如 部门/类型/密级）
+python -m app.rag.cli search -k default -q "授信额度" --filter '{"部门":"风控"}'
+
+# 7) 审计日志读回
+python -m app.rag.cli audit -k default --tail 20
+
+# 8) 离线自测（不需要大模型和向量模型，验证整条链路）
 python -m app.rag.selftest
+
+# 9) 单元测试套件（516 用例）
+$env:PYTHONPATH='.uv-cache/pytest-deps'; python -m pytest tests -q
 ```
 
 关键配置（`.env`，全部有安全默认值）：
@@ -140,7 +170,14 @@ python -m app.rag.selftest
 | `RAG_CHUNK_OVERLAP` | `80` | 相邻片段重叠字符数 |
 | `RAG_TOP_K` / `RAG_TOP_N` | `10` / `4` | 粗排候选数 / 精排后送入大模型的条数 |
 | `RAG_RERANK_MODE` | `lexical` | `lexical` / `llm` / `off` |
-| `RAG_MIN_SCORE` | `0.2` | 拒答阈值（比较的是**向量余弦**，见 5.11） |
+| `RAG_MIN_SCORE` | `0.2` | 拒答阈值（比较的是**向量余弦**，见 5.10） |
+| `RAG_QUERY_REWRITE` | `local` | `off` / `local` / `llm` / `local+llm`；改写开关 |
+| `RAG_CACHE_ENABLED` | `false` | 三级缓存总开关（默认关，避免过期答案） |
+| `RAG_AUDIT_ENABLED` | `true` | 审计日志开关 |
+| `RAG_OCR_ENABLED` | `true` | OCR 开关（后端不可用自动降级） |
+| `RAG_OCR_BACKEND` | `windows` | `windows` / `rapidocr` / `none` |
+
+完整的配置清单见 `.env.example` 与各专题文档。
 
 ---
 
@@ -178,6 +215,24 @@ BM25 已经用过词频了，如果词面重排再用一遍词频/覆盖，就�
 本地向量模型需要：装 `sentence-transformers`（会牵动 torch）、联网下载约 95MB 模型、磁盘空间。任何一条不满足，整条 RAG 链路就完全不可用。
 
 `hash` 后端用字符 n-gram 哈希 + sublinear TF + L2 归一化，**没有真正的语义能力**，但能让「解析 → 切块 → 入库 → 检索 → 生成」全链路跑通，也让单元测试和 CI 不依赖网络与模型。这是工程可用性的兜底，不是质量方案，代码里已明确标注。
+
+### 4.6 为什么 OCR 用 Windows 内置引擎，而不是 RapidOCR/PaddleOCR
+
+本机 pip 装 torch 系依赖会空转卡死、系统 site-packages 不可写——RapidOCR（onnxruntime）、PaddleOCR（paddle）都装不上。而 Windows 自带的 `Windows.Media.Ocr` 引擎**已装简体中文包**、`Windows.Data.Pdf` 能渲染 PDF 页，整条「扫描件 → 页转图 → OCR」链路**零 pip 依赖**就能跑通。
+
+代价是质量与平台绑定：正文页识别好、设计类封面页差（丢数字、错字随倍率变），且只在 Windows 可用。因此把它做成**可插拔后端**（`windows` / `rapidocr` / `none`），并定位为**兜底**而非常规路径——有文本层的 PDF 绝不触发 OCR（见 5.14）。详见 `docs/rag-ocr.md`。
+
+### 4.7 为什么查询/生成缓存默认关闭
+
+查询缓存一旦陈旧就是「返回过期答案」，这种风险不该由默认配置承担。所以三级缓存（embedding / 查询 / 生成）统一受一个总开关控制，**默认 false**。embedding 缓存虽然是内容寻址（同文本+同后端=同向量，语义上不可能陈旧），也一起关，保持「一个开关解释全部行为」。缓存键里都带**向量指纹 + 数据版本号**，库内任何 chunk 增删改都会让查询/生成缓存整体失效。
+
+### 4.8 为什么审计日志"绝不拖垮查询"
+
+审计是旁路关注点，不该影响主链路。所以：JSONL 追加写、**不含原文**（避免日志爆炸）、写失败只 warning 不抛异常。这样即使审计目录不可写，检索/问答也照常返回——审计是「尽力而为」的记录，不是「必须成功」的依赖。
+
+### 4.9 为什么低分重试的判定分必须用向量余弦
+
+查询改写会带来多个变体，每个变体各有检索结果。判断"要不要用变体重试"、以及"重试后是否改善"，必须用**同一个尺度**。重排分（词面覆盖率/大模型打分）随重排模式变、绝对尺度不稳定；向量余弦是唯一跨模式稳定的量。所以重试判定与最终拒答统一用 `grounded_score()`（向量余弦），排序才用重排分。这是 5.10 那类"排序分/判定分混用"教训在改写链路里的再次应用。
 
 ---
 
@@ -348,33 +403,86 @@ BM25 已经用过词频了，如果词面重排再用一遍词频/覆盖，就�
 
 **已知低效点**：`_bm25_index()` 在数据变更后重建整个索引；入库是单进程同步的，大目录会等待较久。都留到下一版（增量索引 / 后台任务）。
 
+### 5.14 OCR 的"文本层优先"与质量边界
+
+**现象**：同一份 PDF，有文本层的页抽取又快又准，扫描页只能 OCR，而 OCR 对设计类排版会丢数字、出错字（实测封面页 `2026年全球`→`6 年全球`，`贝莱德`→`贝菜德`）。
+
+**教训**：OCR 是**兜底**，绝不能用它替换本来干净的文本层——否则等于用更差的结果换掉好结果。实现上必须**逐页判定**：文本层不足（默认 < 50 字符）才对该页 OCR，并用计数器取证（真实 17 页 PDF 入库 `OCR_CALLS=0`）。质量数据要如实记录差案例，不能只报好结果。
+
+**平台坑**：Windows OCR 有稳定副作用——汉字间插空格（`风 控`）、`。`→`·`、`%`→`％`、范围号 `–`→`一`；这些空格可由 `normalize_text` 清理（注意只清 `[ \t]+`、不吞换行，见 5.18），但字符混淆无法自动修正，只能如实告知使用者。
+
+### 5.15 查询缓存键漏掉 `top_n` 导致"少拿结果"
+
+**现象**：开启缓存后，`top_n=2` 写入的缓存会被 `top_n=10` 的调用命中，导致只拿到 2 条结果。
+
+**原因**：缓存键只拼了 `(query, filter, 指纹, 数据版本号)`，没包含"取多少条"这个维度。
+
+**解决**：把 `top_n` 加进缓存键。`top_k` / `rerank` 开关仍未进键（默认缓存关闭，实际影响小），文档 §4.5 如实标注了这条局限。
+
+**教训**：缓存键必须覆盖**所有影响结果形态的入参**。漏一个维度，缓存就从"加速器"变成"正确性 bug"，而且只在开着缓存时偶发，极难排查。
+
+### 5.16 审计字段 `llm.called` 的语义陷阱
+
+**现象**：拒答场景下，审计日志仍记 `llm.called=true`。
+
+**原因**：早期实现用「客户端是否可用」当 `llm.called`，而拒答路径虽然客户端可用，却根本没发起生成调用。
+
+**解决**：改为由 `generate()` 在真正调用 `client.complete()` 前置 debug 标记，pipeline 读这个标记——无客户端/拒答/异常都记 false。
+
+**教训**：审计字段要记录"**实际发生了什么**"，而不是"是否具备发生的能力"。这两个量在正常路径上相同，只在降级/拒答路径上分道扬镳，而后者正是审计最该看清的地方。
+
+### 5.17 沙箱下 3.12+ 的 `0o700` 目录自毁
+
+**现象**：pytest 的 tmpdir 插件、`tempfile.mkdtemp()` 在 Python 3.12/3.13 下建出的目录，**连创建它的进程自己都访问不了**（WinError 5），目录永久不可删。
+
+**原因**：这些 API 用 `os.mkdir(d, 0o700)` 建目录，而本沙箱对 0o700 目录有特殊的权限处理；3.10 免疫，项目自身代码（默认 mode 的 `mkdir`）不受影响。
+
+**解决**：测试套件统一 `-p no:tmpdir`（禁用 pytest tmpdir 插件），`tmp_path` 由 conftest 用默认 mode 自供。这从设计上消掉了整类问题，而非靠 basetemp 技巧绕过。详见 `docs/rag-agent-env.md`。
+
+### 5.18 `normalize_text` 吞掉中文之间的换行（标题吞正文）
+
+**现象**：`# 风控报告\n\n风控模型的准确率为 91.5%。\n\n## 授信\n\n授信要求复核。` 归一化后变成 `# 风控报告风控模型的准确率为 91.5%。...`——标题把正文吞了，最终**整篇退化成 1 个 chunk、heading 全空**。
+
+**原因**：`normalize_text` 原本用 `r"(?<=[CJK])\s+(?=[CJK])"` 删中文之间的多余空格（本意是清理 PDF 逐字抽取产生的空格），但 `\s` **包含换行**，把中文之间的空行也一并删了。
+
+**为什么难发现**：段落以标点结尾时不触发（`第一段。\n\n第二段。` 保持不变），只有「标题行以汉字结尾 + 下段以汉字开头」时才触发；症状与 5.3（漏 `re.MULTILINE`）**一模一样**——都是标题识别失效、整篇 1 个 chunk，但根因完全不同，排查时极易误判。
+
+**解决**：改用 `r"(?<=[CJK])[ \t]+(?=[CJK])"`，只清空格与制表符、保留换行。修复后重建示例库：chunk 数 238 → 248（恢复了 10 处被错误合并的结构边界），评测指标无回退。
+
 ---
 
 ## 六、未解决的问题（下一版候选）
 
 按优先级排序：
 
-1. **扫描件 OCR**：目前无文本层 PDF 完全不可用，需要接 PP-Structure 或 OCR 服务。
-2. **查询改写与多跳检索**：复杂问题目前靠子智能体多轮换角度检索（Agentic 雏形），没有 HyDE / 查询扩展 / 自动多跳。
-3. **ANN 索引**：十万级片段以上必须引入 HNSW / IVF，或做「BM25 粗筛 + 向量精排」的分级检索。
+1. **权限与多租户隔离**：知识库目前没有按用户/部门的访问控制，元数据已具备（frontmatter 抽取 + 过滤），但缺 ACL 与鉴权绑定。
+2. **ANN 索引**：十万级片段以上必须引入 HNSW / IVF，或做「BM25 粗筛 + 向量精排」的分级检索。
+3. **真实 BGE 语义向量验证**：当前所有指标仍基于 hash 兜底向量（无真正语义）；装上 `sentence-transformers` 换 local 后端后需**重新入库 + 重新标定 `RAG_MIN_SCORE`**。
 4. **增量索引**：BM25 目前全量重建，大库入库会变慢。
-5. **权限与多租户隔离**：知识库目前没有按用户/部门的访问控制。
-6. **生成质量评测**：现有评测只覆盖检索层（Hit@k / MRR / 拒答率），没有 faithfulness / answer relevancy 这类生成指标。
-7. **上下文压缩**：送入大模型的片段是原文，长片段会浪费 token，可以做句子级抽取式压缩。
-8. **表格结构化检索**：现在表格被当普通文本，数值问答（求和、比较、筛选）不可靠，应走 SQL / 表格专用检索。
+5. **上下文压缩**：送入大模型的片段是原文，长片段会浪费 token，可以做句子级抽取式压缩。
+6. **表格结构化检索**：现在表格被当普通文本，数值问答（求和、比较、筛选）不可靠，应走 SQL / 表格专用检索。
+7. **生成质量评测落地**：RAGAS 方案已就绪（脚本 + 文档），但本机装不上依赖、judge 需付费，尚未跑过一次真实 RAGAS 评测。
+8. **缓存增强**：无 TTL / 容量上限 / LRU / 跨进程锁（见 `rag-enterprise-features.md` §4.5）。
+
+已从上一版"未解决"清单移除（本轮已实现）：扫描件 OCR（→ 方案 A，零依赖）、查询改写与多跳（→ 本地 + 大模型改写 + 低分重试）、生成质量评测（→ RAGAS 方案 + 离线替代）。
 
 ---
 
 ## 七、验收证据
 
-### 7.1 离线自测（不依赖大模型与向量模型）
+### 7.1 离线自测与单元测试套件
 
 ```bash
+# 冒烟自测（不依赖大模型与向量模型）
 python -m app.rag.selftest
 # ──── 自测结果:18 通过 / 0 失败 ────
+
+# 完整测试套件
+$env:PYTHONPATH='.uv-cache/pytest-deps'; python -m pytest tests -q
+# 516 passed（含元数据 50 / 缓存 19 / 审计 19 / OCR 24 / 改写 49 / 评测 63 等）
 ```
 
-覆盖：入库、切块结构、重复入库幂等、混合检索、BM25 专有名词命中、重排生效、无依据拒答、向量指纹校验、持久化重载、多格式文件入库。
+覆盖：入库、切块结构、重复入库幂等、混合检索、BM25 专有名词命中、重排生效、无依据拒答、向量指纹校验、持久化重载、多格式文件入库、元数据过滤、缓存命中/失效、审计写入/读回、OCR 降级与文本层优先、查询改写收益、离线评测幻觉识别。
 
 ### 7.2 检索评测
 
@@ -390,7 +498,7 @@ python -m app.rag.cli eval  -k demo --embedding-provider hash -e examples/rag_ev
 | 混合检索 + 词面重排 | 100% | 0.9167 | 100% | 100% |
 | 混合检索，关闭重排 | 100% | 0.9167 | 100% | 100% |
 
-**真实研报语料（`docs/knowledge_base/金融行业`，143 页 PDF → 238 个片段，8 条样本）**
+**真实研报语料（`docs/knowledge_base/金融行业`，143 页 PDF → 248 个片段，8 条样本）**
 
 ```bash
 python -m app.rag.cli ingest -k fin --embedding-provider hash -p docs/knowledge_base/金融行业
@@ -402,7 +510,16 @@ python -m app.rag.cli eval  -k fin --embedding-provider hash -e examples/rag_eva
 | 混合检索 + 词面重排 | 100% | **1.0000** | 100% | 100% |
 | 混合检索，关闭重排 | 100% | **1.0000** | 100% | 100% |
 
-入库性能：3 份 PDF（143 页、90,845 字符）→ 238 个片段，**6.82 秒**（含解析、切块、向量化、落盘）。
+入库性能：3 份 PDF（143 页、90,845 字符）→ 248 个片段，**6.82 秒**（含解析、切块、向量化、落盘）。注意片段数从早期 238 变为 248，是修复 5.18（`normalize_text` 吞换行）后恢复了 10 处结构边界所致。
+
+**查询改写收益（短/口语/异词查询评测集，10 题，hash 向量）**：
+
+| 配置 | Hit@5 | MRR | 拒答准确率 |
+| --- | --- | --- | --- |
+| 改写关闭 | 87.50% | 0.7812 | 100% |
+| 改写开启（local + 低分重试） | **100%** | **1.0000** | 100% |
+
+6 条短/口语/异词查询中，4 条从「低于阈值会拒答」变成「可答复」（如"成交比例"0.1541→0.2181、"限额"0.1595→0.4497）。详见 `docs/rag-query-rewrite.md`。
 
 > **必须诚实说明这份指标的三点局限**：
 >
@@ -447,6 +564,7 @@ python -m app.rag.cli eval  -k fin --embedding-provider hash -e examples/rag_eva
 
 - **旧代码保留**：`app/ragflow/`（SDK 调用示例）、`app/tools/ragflow_tools.py` 仍在仓库中，但**已不在 Agent 装配链路里**（`knowledge_base_agent` 已改为引用 `app/tools/rag_tools.py`）。
 - **配置保留**：`Settings.ragflow_api_url` / `ragflow_api_key` 保留，仅用于回滚旧链路。
-- **依赖**：`requirements.txt` 中 `ragflow-sdk` 已注释，新增 `sentence-transformers` / `jieba` / `faiss-cpu`（可选）。
+- **依赖**：`ragflow-sdk` 已注释；`sentence-transformers` 移为可选 extra（`local-embedding`），`jieba` 为核心依赖，`faiss-cpu` 可选。详见 `pyproject.toml` 的 `[project.optional-dependencies]`。
 - **回滚方式**：把 `app/agent/subagents/knowledge_base_agent.py` 的 import 与 tools 换回 `ragflow_tools` 的两个工具，并在 `app/prompt/prompts.yml` 里恢复 `ragflow` 段落即可（两处改动，且 prompts 里新段落名是 `rag`）。
 - **数据目录**：`rag_data/` 可以整体删除或拷贝到其他机器复用；`meta.json` 里的向量指纹会保护你不会在新机器上误用不兼容的向量。
+- **运行时产物**：`rag_data/<kb>/.cache/`（缓存）、`rag_data/.audit/`（审计）均已被 `.gitignore` 排除，不进版本控制。
