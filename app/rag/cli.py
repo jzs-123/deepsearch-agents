@@ -28,7 +28,7 @@ if __package__ in (None, ""):  # pragma: no cover
 
 from app.rag.config import load_rag_config  # noqa: E402
 from app.rag.eval import evaluate, format_report, load_eval_set  # noqa: E402
-from app.rag.pipeline import get_pipeline  # noqa: E402
+from app.rag.pipeline import format_search_audit, get_pipeline  # noqa: E402
 from app.rag.vectorstore import EmbeddingMismatchError, list_knowledge_bases  # noqa: E402
 
 
@@ -51,6 +51,33 @@ def build_parser() -> argparse.ArgumentParser:
             help="临时覆盖向量后端(便于对比不同后端的效果)",
         )
 
+    def add_rewrite_args(p: argparse.ArgumentParser, with_always: bool = False) -> None:
+        """查询改写相关开关(检索类命令共用)。
+
+        存在的意义就是「能对比」:同一份语料、同一个问题,分别用关闭 / 低分重试 / 始终改写跑一遍,
+        差异才有解释力。
+        """
+        p.add_argument(
+            "--rewrite-mode",
+            choices=["off", "local", "llm", "local+llm"],
+            default=None,
+            help="查询改写模式,默认取 RAG_QUERY_REWRITE(应用默认 local)",
+        )
+        p.add_argument("--no-rewrite", action="store_true", help="关闭查询改写(= --rewrite-mode off)")
+        p.add_argument(
+            "--variants",
+            type=int,
+            default=None,
+            help="变体总数上限(含原始查询),默认取 RAG_QUERY_VARIANTS",
+        )
+        p.add_argument("--no-retry", action="store_true", help="低分时不自动用变体重试")
+        if with_always:
+            p.add_argument(
+                "--rewrite-always",
+                action="store_true",
+                help="首轮就用全部变体(不等低分触发重试)",
+            )
+
     p_list = sub.add_parser("list", help="列出所有知识库")
     p_list.add_argument("--json", action="store_true", help="以 JSON 输出")
 
@@ -66,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_search = sub.add_parser("search", help="检索(不调用大模型)")
     add_common(p_search)
+    add_rewrite_args(p_search, with_always=True)
     p_search.add_argument("-q", "--question", required=True)
     p_search.add_argument("-n", "--top-n", type=int, default=None, help="返回条数")
     p_search.add_argument("--top-k", type=int, default=None, help="粗排候选数")
@@ -76,12 +104,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ask = sub.add_parser("ask", help="检索 + 大模型生成带引用的答案")
     add_common(p_ask)
+    add_rewrite_args(p_ask)
     p_ask.add_argument("-q", "--question", required=True)
     p_ask.add_argument("-n", "--top-n", type=int, default=None)
     p_ask.add_argument("--json", action="store_true")
 
     p_eval = sub.add_parser("eval", help="用评测集评估检索质量")
     add_common(p_eval)
+    add_rewrite_args(p_eval, with_always=True)
     p_eval.add_argument("-e", "--eval-set", required=True, help="评测集 JSON/JSONL 路径")
     p_eval.add_argument("-n", "--k", type=int, default=5, help="评测的 top-k,默认 5")
     p_eval.add_argument(
@@ -114,6 +144,15 @@ def _build_config(args) -> object:
         overrides["top_k"] = args.top_k
     if getattr(args, "no_rerank", False):
         overrides["rerank_mode"] = "off"
+    # 查询改写开关(只有 search/ask/eval 传了这些参数)
+    if getattr(args, "no_rewrite", False):
+        overrides["query_rewrite"] = "off"
+    elif getattr(args, "rewrite_mode", None):
+        overrides["query_rewrite"] = args.rewrite_mode
+    if getattr(args, "variants", None):
+        overrides["query_variants"] = args.variants
+    if getattr(args, "no_retry", False):
+        overrides["retry_on_low_score"] = False
     return load_rag_config(**overrides)
 
 
@@ -175,25 +214,36 @@ def cmd_search(args) -> int:
     if not len(pipeline.store):
         print(f"知识库 {pipeline.kb} 是空的,请先 ingest 文档", file=sys.stderr)
         return 1
-    results = pipeline.search(args.question, top_k=config.top_k, top_n=config.top_n)
+    results = pipeline.search(
+        args.question,
+        top_k=config.top_k,
+        top_n=config.top_n,
+        rewrite=True if getattr(args, "rewrite_always", False) else None,
+    )
     if args.json:
         print(
             json.dumps(
-                [
-                    {
-                        "rank": item.rank,
-                        "score": round(item.score, 4),
-                        "rrf": round(item.rrf_score, 4),
-                        "dense": None if item.dense_score is None else round(item.dense_score, 4),
-                        "sparse": None if item.sparse_score is None else round(item.sparse_score, 4),
-                        "channels": item.channels,
-                        "source": item.chunk.source,
-                        "chunk_index": item.chunk.chunk_index,
-                        "heading": item.chunk.heading,
-                        "text": item.chunk.text,
-                    }
-                    for item in results
-                ],
+                {
+                    "rewrite": pipeline.last_search_debug.get("rewrite"),
+                    "retry": pipeline.last_search_debug.get("retry"),
+                    "variants": pipeline.last_search_debug.get("variants", []),
+                    "variant_hits": pipeline.last_search_debug.get("variant_hits", []),
+                    "results": [
+                        {
+                            "rank": item.rank,
+                            "score": round(item.score, 4),
+                            "rrf": round(item.rrf_score, 4),
+                            "dense": None if item.dense_score is None else round(item.dense_score, 4),
+                            "sparse": None if item.sparse_score is None else round(item.sparse_score, 4),
+                            "channels": item.channels,
+                            "source": item.chunk.source,
+                            "chunk_index": item.chunk.chunk_index,
+                            "heading": item.chunk.heading,
+                            "text": item.chunk.text,
+                        }
+                        for item in results
+                    ],
+                },
                 ensure_ascii=False,
                 indent=2,
             )
@@ -201,6 +251,10 @@ def cmd_search(args) -> int:
         return 0
     print(f"问题:{args.question}")
     print(f"命中 {len(results)} 条(向量后端:{pipeline.embedder.fingerprint},重排:{config.rerank_mode})")
+    # 改写可见性(默认输出,不是 debug 开关):用了哪些变体、各自命中几条、是否重试、重试后判定分
+    audit = format_search_audit(pipeline.last_search_debug)
+    if audit:
+        print(audit)
     # 阈值提示:search 只做检索、不做拒答,但要让使用者知道「这些片段够不够作为依据」
     gate = pipeline.grounded_score(results)
     if results and gate < config.min_score:
@@ -244,7 +298,12 @@ def cmd_eval(args) -> int:
     config = _build_config(args)
     pipeline = get_pipeline(kb=args.kb, config=config)
     items = load_eval_set(args.eval_set)
-    result = evaluate(pipeline, items, k=args.k)
+    result = evaluate(
+        pipeline,
+        items,
+        k=args.k,
+        rewrite=True if getattr(args, "rewrite_always", False) else None,
+    )
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     else:

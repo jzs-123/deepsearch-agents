@@ -74,6 +74,28 @@ class Settings(BaseSettings):
     rag_rrf_k: int = 60
     # 低于该相似度视为「知识库中没有依据」,直接拒答而不是让模型编造
     rag_min_score: float = 0.2
+    # ─── 自研 RAG:查询改写(Query Rewrite) ────────────────
+    # off(关闭) / local(本地规则,零成本) / llm(大模型,失败降级本地) / local+llm(两级都用)
+    # 应用级默认 local:CLI 与 Agent 工具都经 load_rag_config() 读配置,所以默认开启改写。
+    # (app/rag/config.py 里 RagConfig 的数据类默认值是 off,保证直接构造配置的调用方行为不变)
+    rag_query_rewrite: str = "local"
+    # 变体总数上限(含原始查询——原始查询永远保留,所以 >= 1)
+    rag_query_variants: int = 3
+    # 首轮判定分(向量余弦)低于 rag_min_score 时,自动用改写变体重试一次再判定
+    rag_retry_on_low_score: bool = True
+    # 补充同义词表,格式 "key=alt1|alt2;key2=alt"(内置词表见 app/rag/rewrite.py)
+    rag_rewrite_synonyms: str = ""
+
+    # ─── OCR(图片/扫描件兜底;方案 A:默认 Windows 内置引擎,零 pip 依赖) ───
+    # 总开关。关闭后:图片文件不会被解析、扫描件页只保留文本层 —— 链路仍然可用。
+    rag_ocr_enabled: bool = True
+    # 后端:windows(系统内置 Windows.Media.Ocr,仅 Windows) / rapidocr(需装 rapidocr-onnxruntime) / none
+    # 后端不可用时自动降级为 none 并 warning,**不影响入库**(OCR 是兜底,不是主路径)
+    rag_ocr_backend: str = "windows"
+    # PDF 单页文本层字符数低于该值时对该页做 OCR 兜底(0 = 关闭页级 OCR)
+    rag_ocr_min_text_chars: int = 50
+    # OCR 语言(BCP-47);Windows 需已安装对应语言包,否则引擎创建失败并降级
+    rag_ocr_language: str = "zh-Hans-CN"
 
     # ─── MySQL ────────────────────────────────────────────
     mysql_user: str = "root"

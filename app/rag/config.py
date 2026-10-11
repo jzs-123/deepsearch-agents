@@ -13,6 +13,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from app.core.config import PROJECT_ROOT, settings
+from app.rag.ocr import OCR_BACKENDS, OcrOptions
+from app.rag.rewrite import REWRITE_MODES
 
 # 合法取值枚举,便于 CLI 直接校验用户输入
 EMBEDDING_PROVIDERS = ("local", "openai", "hash")
@@ -43,6 +45,28 @@ class RagConfig:
     rerank_mode: str = "lexical"
     min_score: float = 0.2
 
+    # 查询改写(Query Rewrite)
+    # 注意:**数据类默认值是 off**,保证直接构造 RagConfig 的调用方(含既有单元测试)行为与改写功能
+    # 引入前逐字节一致;应用级默认由 Settings.rag_query_rewrite 提供(= local),CLI 与 Agent 工具
+    # 都走 load_rag_config(),所以生产路径默认开启改写。见 docs/rag-query-rewrite.md 第 6 节。
+    query_rewrite: str = "off"
+    # 变体总数上限(含原始查询):原始查询永远保留,所以 >= 1
+    query_variants: int = 3
+    # 首轮判定分(向量余弦)低于 min_score 时,是否用改写变体自动重试一次
+    retry_on_low_score: bool = True
+    # 补充同义词表,格式 "key=alt1|alt2;key2=alt"
+    rewrite_synonyms: str = ""
+
+    # OCR(图片/扫描件兜底)
+    # 默认开启:但只对**文本层过少的页**生效 —— 有文本层的页面不会被 OCR 覆盖
+    # (否则就是用更差的识别结果替换干净原文,是净损失,见 docs/rag-ocr.md)
+    ocr_enabled: bool = True
+    # windows(系统内置,仅 Windows) / rapidocr(需装 rapidocr-onnxruntime) / none
+    ocr_backend: str = "windows"
+    # PDF 单页文本层字符数低于该值时对该页做 OCR(0 = 关闭页级 OCR)
+    ocr_min_text_chars: int = 50
+    ocr_language: str = "zh-Hans-CN"
+
     # 生成所用大模型(与主项目共用一套 OpenAI 兼容配置)
     llm_model: str = ""
     llm_base_url: str = ""
@@ -66,6 +90,27 @@ class RagConfig:
             )
         if self.top_n > self.top_k:
             raise ValueError(f"top_n({self.top_n}) 不能大于 top_k({self.top_k})")
+        if self.query_rewrite not in REWRITE_MODES:
+            raise ValueError(
+                f"query_rewrite 必须是 {REWRITE_MODES} 之一,当前为 {self.query_rewrite!r}"
+            )
+        if self.query_variants < 1:
+            raise ValueError("query_variants 至少为 1(原始查询本身也算一个变体)")
+        if self.ocr_backend not in OCR_BACKENDS:
+            raise ValueError(
+                f"ocr_backend 必须是 {OCR_BACKENDS} 之一,当前为 {self.ocr_backend!r}"
+            )
+        if self.ocr_min_text_chars < 0:
+            raise ValueError("ocr_min_text_chars 不能为负数(0 表示关闭页级 OCR)")
+
+    def ocr_options(self) -> OcrOptions:
+        """转成 OCR 层使用的选项对象(loaders 只认 OcrOptions,不反向依赖 RagConfig)。"""
+        return OcrOptions(
+            enabled=self.ocr_enabled,
+            backend=self.ocr_backend,
+            min_text_chars=self.ocr_min_text_chars,
+            language=self.ocr_language,
+        )
 
     @property
     def data_path(self) -> Path:
@@ -96,6 +141,14 @@ def load_rag_config(**overrides) -> RagConfig:
         rrf_k=settings.rag_rrf_k,
         rerank_mode=settings.rag_rerank_mode,
         min_score=settings.rag_min_score,
+        query_rewrite=settings.rag_query_rewrite,
+        query_variants=settings.rag_query_variants,
+        retry_on_low_score=settings.rag_retry_on_low_score,
+        rewrite_synonyms=settings.rag_rewrite_synonyms,
+        ocr_enabled=settings.rag_ocr_enabled,
+        ocr_backend=settings.rag_ocr_backend,
+        ocr_min_text_chars=settings.rag_ocr_min_text_chars,
+        ocr_language=settings.rag_ocr_language,
         llm_model=settings.llm_model,
         llm_base_url=settings.openai_base_url,
         llm_api_key=settings.openai_api_key,

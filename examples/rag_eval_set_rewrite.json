@@ -1,0 +1,55 @@
+{
+  "description": "查询改写(Query Rewrite)专用评测集:刻意使用「短查询 / 与文档用词不一致 / 口语化」的问法,用于对比 RAG_QUERY_REWRITE=off 与开启(local,低分自动重试)的召回差异。语料在 examples/test_docs_rewrite/,入库命令见 docs/rag-query-rewrite.md。注意:语料里**故意不出现**查询原词(例如语料只写「目标完成率」「授信额度上限」,不写「达标率」「限额」),否则就测不出改写的作用。",
+  "items": [
+    {
+      "question": "成交比例",
+      "expected_sources": ["交易指标.md"],
+      "note": "短查询 + 与文档用词不一致(文档写的是「转化率」)"
+    },
+    {
+      "question": "达标率",
+      "expected_sources": ["风控指标口径.md"],
+      "note": "短查询(文档写的是「目标完成率」)"
+    },
+    {
+      "question": "限额",
+      "expected_sources": ["风控指标口径.md"],
+      "note": "短查询(文档写的是「授信额度上限 / 单笔上限」)"
+    },
+    {
+      "question": "请问一下夜间要是没人回咋办",
+      "expected_sources": ["客服响应规范.md"],
+      "note": "口语化(文档写的是「非工作时间 / 无人值守 / 跟进处理」)"
+    },
+    {
+      "question": "KPI 达标情况",
+      "expected_sources": ["风控指标口径.md"],
+      "note": "英文缩写 + 异词(文档写的是「目标完成率」)"
+    },
+    {
+      "question": "夜间没人应答算不算超时",
+      "expected_sources": ["客服响应规范.md"],
+      "note": "口语化 + 异词(文档写的是「无人值守」「超出时限」)"
+    },
+    {
+      "question": "客服响应时限是多少",
+      "expected_sources": ["客服响应规范.md"],
+      "note": "对照项:用词与文档一致,改写前后都应命中"
+    },
+    {
+      "question": "A13 模型的准确率",
+      "expected_sources": ["风控指标口径.md"],
+      "note": "对照项:专有名词查询,改写前后都应命中"
+    },
+    {
+      "question": "公司食堂本周的菜单是什么",
+      "expect_no_answer": true,
+      "note": "拒答守门:改写不得把无关问题变成「有依据」"
+    },
+    {
+      "question": "2026 年世界杯的冠军是哪支球队",
+      "expect_no_answer": true,
+      "note": "拒答守门"
+    }
+  ]
+}

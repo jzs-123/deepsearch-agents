@@ -55,6 +55,9 @@ class EvalResult:
     refusal_accuracy: float = 0.0
     per_query: list[dict] = field(default_factory=list)
     config: dict = field(default_factory=dict)
+    # 查询改写的可观测统计(默认采集,便于回答"改写到底起没起作用")
+    rewrite_mode: str = "off"
+    rewrite_stats: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +67,8 @@ class EvalResult:
             "recall_at_k": round(self.recall_at_k, 4),
             "refusal_accuracy": round(self.refusal_accuracy, 4),
             "config": self.config,
+            "rewrite_mode": self.rewrite_mode,
+            "rewrite_stats": self.rewrite_stats,
             "per_query": self.per_query,
         }
 
@@ -102,11 +107,15 @@ def evaluate(
     pipeline: RagPipeline,
     items: list[EvalItem],
     k: int = 5,
+    rewrite: bool | None = None,
 ) -> EvalResult:
     """对给定流水线跑一遍评测。
 
     注意:这里评测的是「检索层」,不调用生成模型 —— 生成质量受模型波动影响大,
     检索指标才是切块/向量/融合/重排这些自研部分能直接优化的对象。
+
+    :param rewrite: 透传给 `pipeline.search`:None=按配置(默认 local,低分自动重试)、
+        False=关闭改写(对比基线)、True=首轮就用全部变体
     """
     result = EvalResult(total=len(items))
     result.config = {
@@ -117,6 +126,10 @@ def evaluate(
         "top_k": pipeline.config.top_k,
         "rerank_mode": pipeline.config.rerank_mode,
         "rrf_k": pipeline.config.rrf_k,
+        "query_rewrite": pipeline.config.query_rewrite,
+        "query_variants": pipeline.config.query_variants,
+        "retry_on_low_score": pipeline.config.retry_on_low_score,
+        "rewrite_override": rewrite,
         "k": k,
     }
 
@@ -126,12 +139,55 @@ def evaluate(
     graded = 0
     refusal_correct = 0
     refusal_total = 0
+    # 改写可观测性:默认采集(评测里看不到改写有没有生效,就没法解释指标变化)
+    rewrite_stats: dict = {
+        "mode": "off",
+        "queries": len(items),
+        "multi_variant_queries": 0,
+        "retry_triggered": 0,
+        "retry_improved": 0,
+        "gate_before_vs_after": [],
+        "variant_query_examples": [],
+        "llm_used": 0,
+        "llm_degraded": 0,
+    }
 
     for item in items:
-        chunks = pipeline.search(item.question, top_k=max(k, pipeline.config.top_k), top_n=k)
+        chunks = pipeline.search(
+            item.question,
+            top_k=max(k, pipeline.config.top_k),
+            top_n=k,
+            rewrite=rewrite,
+        )
         retrieved = [c.chunk.source for c in chunks]
         # 拒答判定与线上一致:一律用向量余弦(重排分的尺度不能直接和阈值比)
         top_score = pipeline.grounded_score(chunks)
+        audit = pipeline.last_search_debug or {}
+        rewrite_stats["mode"] = audit.get("rewrite_mode", rewrite_stats["mode"])
+        variants = audit.get("variants") or []
+        if len(variants) > 1:
+            rewrite_stats["multi_variant_queries"] += 1
+            if len(rewrite_stats["variant_query_examples"]) < 5:
+                rewrite_stats["variant_query_examples"].append(
+                    {"question": item.question, "variants": variants}
+                )
+        retry = audit.get("retry") or {}
+        if retry.get("triggered"):
+            rewrite_stats["retry_triggered"] += 1
+            if retry.get("improved"):
+                rewrite_stats["retry_improved"] += 1
+            rewrite_stats["gate_before_vs_after"].append(
+                {
+                    "question": item.question,
+                    "before": retry.get("gate_before"),
+                    "after": retry.get("gate_after"),
+                }
+            )
+        rewrite_meta = audit.get("rewrite") or {}
+        if rewrite_meta.get("llm_used"):
+            rewrite_stats["llm_used"] += 1
+        if rewrite_meta.get("degraded"):
+            rewrite_stats["llm_degraded"] += 1
 
         if item.expect_no_answer:
             refusal_total += 1
@@ -146,6 +202,8 @@ def evaluate(
                     "retrieved": retrieved,
                     "top_score": round(top_score, 4),
                     "passed": bool(passed),
+                    "variants": variants,
+                    "retry_triggered": bool(retry.get("triggered")),
                 }
             )
             continue
@@ -174,6 +232,8 @@ def evaluate(
                 "top_score": round(top_score, 4),
                 "first_hit_rank": rank_of_first_hit,
                 "hit": bool(hit),
+                "variants": variants,
+                "retry_triggered": bool(retry.get("triggered")),
             }
         )
 
@@ -183,6 +243,8 @@ def evaluate(
         result.recall_at_k = recall_sum / graded
     if refusal_total:
         result.refusal_accuracy = refusal_correct / refusal_total
+    result.rewrite_mode = rewrite_stats["mode"]
+    result.rewrite_stats = rewrite_stats
     return result
 
 
@@ -195,20 +257,31 @@ def format_report(result: EvalResult) -> str:
         f"MRR: {result.mrr:.4f}",
         f"Recall@{result.config.get('k')}: {result.recall_at_k:.2%}",
         f"拒答准确率: {result.refusal_accuracy:.2%}",
+        f"查询改写: {result.rewrite_mode}"
+        f"(多变体查询 {result.rewrite_stats.get('multi_variant_queries', 0)}/{result.total}"
+        f" | 触发重试 {result.rewrite_stats.get('retry_triggered', 0)}"
+        f" | 重试后改善 {result.rewrite_stats.get('retry_improved', 0)}"
+        f" | 大模型改写 {result.rewrite_stats.get('llm_used', 0)} 次"
+        f" / 降级 {result.rewrite_stats.get('llm_degraded', 0)} 次)",
         f"配置: {json.dumps(result.config, ensure_ascii=False)}",
         "",
         "逐条结果:",
     ]
     for row in result.per_query:
+        variant_note = ""
+        if len(row.get("variants") or []) > 1:
+            variant_note = f" 变体={len(row['variants'])}"
+        if row.get("retry_triggered"):
+            variant_note += " 已重试"
         if row.get("expect_no_answer"):
             lines.append(
                 f"  [{'OK' if row['passed'] else 'MISS'}] (应拒答) {row['question']}"
-                f" -> 最高分 {row.get('top_score')}"
+                f" -> 最高分 {row.get('top_score')}{variant_note}"
             )
         else:
             mark = "HIT" if row.get("hit") else "MISS"
             lines.append(
-                f"  [{mark} rank={row.get('first_hit_rank')} score={row.get('top_score')}] "
+                f"  [{mark} rank={row.get('first_hit_rank')} score={row.get('top_score')}{variant_note}] "
                 f"{row['question']} -> 命中来源 {row.get('retrieved')}"
             )
     return "\n".join(lines)

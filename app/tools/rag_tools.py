@@ -25,8 +25,27 @@ from langchain_core.tools import tool
 
 from app.api.monitor import monitor
 from app.rag.config import load_rag_config
-from app.rag.pipeline import RagPipeline, get_pipeline
+from app.rag.pipeline import RagPipeline, format_search_audit, get_pipeline
 from app.rag.vectorstore import EmbeddingMismatchError, list_knowledge_bases as _list_kbs
+
+
+def _with_audit(text: str, pipeline: RagPipeline) -> str:
+    """把本次检索的改写/重试审计信息追加到工具返回文本后。
+
+    为什么要带出来:改写一旦生效,"召回变好/变差"和"改写做了什么"必须能对上账,
+    否则调参只能靠猜。只在**真的发生了改写或重试**时追加,避免每轮都往模型上下文里
+    塞一行无关的状态(工具返回值是给大模型看的,噪声会挤占预算)。
+    """
+    debug = getattr(pipeline, "last_search_debug", None) or {}
+    variant_count = debug.get("variant_count", len(debug.get("variants") or []))
+    retry_triggered = bool((debug.get("retry") or {}).get("triggered"))
+    llm_error = (debug.get("rewrite") or {}).get("llm_error")
+    if variant_count <= 1 and not retry_triggered and not llm_error:
+        return text
+    audit = format_search_audit(debug)
+    if not audit:
+        return text
+    return f"{text}\n\n【检索过程】\n{audit}"
 
 
 def _open_pipeline_for_query(kb_name: str) -> RagPipeline:
@@ -127,7 +146,10 @@ def search_knowledge_base(question: str, kb_name: str = "", top_n: int = 4) -> s
             f" 标题:{item.chunk.heading or '-'} 匹配度:{item.score:.3f}\n{item.chunk.text}"
             for item in results
         ]
-        return f"在知识库 {pipeline.kb} 中检索到 {len(results)} 个相关片段:\n\n" + "\n\n".join(blocks)
+        out = f"在知识库 {pipeline.kb} 中检索到 {len(results)} 个相关片段:\n\n" + "\n\n".join(blocks)
+        # 改写/重试的审计信息随结果一起返回:模型与人都能看出"这次检索经历了什么"。
+        # 只在真的有变体/重试时追加,保持既有输出格式与断言不被破坏。
+        return _with_audit(out, pipeline)
     except FileNotFoundError:
         return _missing_kb_hint(kb_name or load_rag_config().default_kb)
     except EmbeddingMismatchError as exc:
@@ -169,7 +191,8 @@ def ask_knowledge_base(question: str, kb_name: str = "") -> str:
                 )
         if not answer.grounded:
             lines.append(f"\n（检索调试信息:{json.dumps(answer.debug, ensure_ascii=False)}）")
-        return "\n".join(lines)
+        # 与 search 工具一致:改写/重试过程默认可见(不可观测的机制无法调优)
+        return _with_audit("\n".join(lines), pipeline)
     except FileNotFoundError:
         return _missing_kb_hint(kb_name or load_rag_config().default_kb)
     except EmbeddingMismatchError as exc:
