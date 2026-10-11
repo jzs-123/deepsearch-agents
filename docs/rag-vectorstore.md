@@ -41,8 +41,8 @@
 ```powershell
 cd G:\deepsearch-agents-main
 
-# 本地嵌入模式（免 Docker）
-uv pip install "qdrant-client[local]" --python .venv\Scripts\python.exe
+# 本地嵌入模式（免 Docker；qdrant-client 1.13+ 已内置本地引擎，无需 [local] extra）
+uv pip install qdrant-client --python .venv\Scripts\python.exe
 
 # 远程 server 模式（先 docker 起 qdrant，再只装客户端）
 docker run -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
@@ -52,7 +52,7 @@ uv pip install qdrant-client --python .venv\Scripts\python.exe
 验证：
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import qdrant_client; print(qdrant_client.__version__)"
+.\.venv\Scripts\python.exe -c "import importlib.metadata as m; print('qdrant-client', m.version('qdrant-client'))"
 ```
 
 ## 四、切换到 Qdrant

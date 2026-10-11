@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from pathlib import Path
 from typing import Iterable
 
@@ -179,6 +180,16 @@ class QdrantStore:
                 break
         return points
 
+    @staticmethod
+    def _point_id(chunk_id: str) -> str:
+        """把 chunk_id 稳定映射成合法 UUID。
+
+        Qdrant 本地模式要求 point id 是 UUID，而本项目 chunk_id 是 20 字符 hex（sha1 截断），
+        不是合法 UUID。用 uuid5(NAMESPACE_OID, chunk_id) 做确定性映射：同一个 chunk_id 永远
+        映射到同一个 UUID，幂等语义不变；原始 chunk_id 仍完整保留在 payload 里（chunk.to_dict()）。
+        """
+        return str(uuid.uuid5(uuid.NAMESPACE_OID, chunk_id))
+
     # ────────────────────────── 写入 ──────────────────────────
 
     def add(self, chunks: list[Chunk], vectors, embedding_fingerprint: str) -> int:
@@ -195,19 +206,20 @@ class QdrantStore:
                 f"知识库已有向量来自 [{self.embedding_fingerprint}],不能用 [{embedding_fingerprint}] 追加"
             )
 
-        # 幂等去重：先读回已存在的 id，只 upsert 新的
+        # 幂等去重：先读回已存在的 id（UUID），只 upsert 新的
         existing_ids = {p.id for p in self._scroll_all(with_payload=False)}
 
         from qdrant_client.models import PointStruct
 
         points: list[PointStruct] = []
         for chunk, vector in zip(chunks, vectors):
-            if chunk.chunk_id in existing_ids:
+            point_id = self._point_id(chunk.chunk_id)
+            if point_id in existing_ids:
                 continue
             points.append(
-                PointStruct(id=chunk.chunk_id, vector=vector, payload=chunk.to_dict())
+                PointStruct(id=point_id, vector=vector, payload=chunk.to_dict())
             )
-            existing_ids.add(chunk.chunk_id)
+            existing_ids.add(point_id)
 
         if not points:
             return 0
