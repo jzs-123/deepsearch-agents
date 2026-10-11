@@ -877,10 +877,12 @@ class RagPipeline:
                 answer = None
 
         if answer is None:
-            llm_called = self._llm_client() is not None
             answer = AnswerGenerator(
                 client=self._llm_client(), min_score=self.config.min_score
             ).generate(question, chunks, gate_score=self.grounded_score(chunks))
+            # llm.called 必须反映「是否真的发起过生成调用」,而不是「客户端是否可用」:
+            # 拒答/无依据/无客户端都会提前返回,并未调用大模型。
+            llm_called = bool(answer.debug.get("llm_called", False))
             if self.cache.enabled and answer.answer:
                 self.cache.put_generation(
                     question,

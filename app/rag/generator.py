@@ -200,9 +200,11 @@ class AnswerGenerator:
             answer.answer = LLM_UNAVAILABLE_ANSWER
             answer.grounded = False
             answer.debug["reason"] = "llm_unavailable"
+            answer.debug["llm_called"] = False
             return answer
 
         try:
+            answer.debug["llm_called"] = True
             text = self.client.complete(
                 SYSTEM_PROMPT, USER_TEMPLATE.format(context=context, question=question)
             )
@@ -212,6 +214,7 @@ class AnswerGenerator:
             answer.grounded = False
             answer.debug["reason"] = "llm_error"
             answer.debug["error"] = str(exc)
+            answer.debug["llm_called"] = False
             return answer
 
         answer.answer = text or NO_EVIDENCE_ANSWER

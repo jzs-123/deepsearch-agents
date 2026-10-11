@@ -16,7 +16,7 @@
 | 1 | **元数据过滤** | 入库时给每个 chunk 打上「文件级 + frontmatter」元数据；检索时按 `{"部门": "风控"}` 这类条件做白名单过滤，**过滤发生在召回之后、重排之前** | 元数据抽取始终开启；过滤由调用方按需传 `filter` | §3.3~§3.5（过滤出/过滤掉/过滤空 三种真实输出） |
 | 2 | **缓存** | embedding / 查询结果 / 生成结果三级缓存，键里带**向量指纹 + 数据版本号**，库一变整体失效；命中时结果标注 `cached=True` | `RAG_CACHE_ENABLED=false`（默认关，避免陈旧答案） | §4.2（冷缓存 0/12 命中 → 热缓存 12/12）、§4.3（miss→hit→库变更后 miss） |
 | 3 | **审计日志** | 每次 `search`/`query` 追加一条 JSONL：时间/查询/过滤/改写变体/是否命中缓存/是否低分重试/结果摘要（**不含原文**）/是否调用大模型与耗时/拒答原因/向量指纹 | `RAG_AUDIT_ENABLED=true`（默认开；写失败只 warning） | §5.2（真实记录 + `cli audit` 读回） |
-| 4 | **向后兼容** | 不传 `filter`、缓存关闭时，`search()/query()` 与引入这三项能力前**逐值一致**（顺序/分数/通道/`cached` 都比对过） | — | §6（快照比对用例）、`pytest tests -q` 460 passed |
+| 4 | **向后兼容** | 不传 `filter`、缓存关闭时，`search()/query()` 与引入这三项能力前**逐值一致**（顺序/分数/通道/`cached` 都比对过） | — | §6（快照比对用例）、`pytest tests -q` 516 passed |
 
 ---
 
@@ -124,6 +124,8 @@ $ python -m app.rag.cli search -k meta_demo --embedding-provider hash -q "准确
 
 ② **等值过滤**（只留风控，且明确写出过滤掉多少候选）：
 
+> ⚠️ **PowerShell 5.1 注意**：下面命令里的内层 JSON 在 PowerShell 5.1 中会被剥掉双引号，导致"过滤条件错误"退出码 2。在 Windows PowerShell 里请把内层双引号用反引号转义，例如 `--filter '{\"部门\": \"风控\"}'`，或在 `bash`/`WSL` 里直接运行原命令。
+
 ```
 $ python -m app.rag.cli search -k meta_demo --embedding-provider hash -q "准确率" -n 3 --filter '{"部门": "风控"}'
 命中 2 条
@@ -189,7 +191,7 @@ search_knowledge_base(question, kb_name="", top_n=4, filter_json="")
 $env:RAG_CACHE_ENABLED='true'      # 或单次命令加 --cache
 ```
 
-**数据版本号**（`meta.json: data_version`）由 `VectorStore.add/delete_document` 递增、`save()` 落盘，因此进程重启后依然有效；`reset()` 会把版本归零并删除整个 `.cache/` 目录。
+**数据版本号**（`meta.json: data_version`）由 `VectorStore.add/delete_document` 递增、`save()` 落盘，因此进程重启后依然有效；`reset()` 会把版本归零并**删除 `.cache/` 目录下的缓存文件**（目录本身保留）。
 
 ### 4.2 真实证据：embedding 缓存冷/热对比
 
@@ -351,14 +353,11 @@ python -m app.rag.cli audit -k meta_demo --tail 5 --json      # JSONL 原样输�
 | 元数据 | 只影响**带 frontmatter** 的文档（本仓库既有语料都没有 frontmatter，切块/向量不变）；没有 frontmatter 的文档行为完全不变 |
 | 锁住兼容性的用例 | `test_rag_metadata.py::test_search_without_filter_matches_legacy_path`（按历史实现手工算一遍再逐值比对）、`test_empty_filter_dict_is_same_as_no_filter`、`test_rag_cache.py::test_search_with_cache_disabled_matches_uncached_content` |
 
-实测数字（本次）：
+实测数字（本次，最终 516 passed）：
 
 ```
-$ python -m pytest tests -q --ignore=tests/test_rag_ocr.py --ignore=tests/test_rag_eval_offline.py
-460 passed in 17.69s          # 374(既有) + 50(metadata) + 18(cache) + 18(audit)
-
 $ python -m pytest tests -q
-513 passed, 1 failed          # 唯一失败是队友在改的 tests/test_rag_ocr.py(缺 reportlab),与本功能无关
+516 passed          # 374(既有) + 50(metadata) + 19(cache) + 19(audit) + 63(eval_offline+eval_ragas) + 1(缓存 top_n 回归) 等
 
 $ python -m app.rag.selftest
 ──── 自测结果:18 通过 / 0 失败 ────

@@ -119,6 +119,26 @@ def test_query_records_refusal_reason(tmp_path, hash_embedder):
     assert record["llm"]["called"] is False, "命中拒答门槛时不应进入大模型"
 
 
+def test_refusal_records_llm_not_called_even_with_available_client(
+    tmp_path, hash_embedder, stub_client, monkeypatch
+):
+    """F2 回归:拒答路径即使客户端可用,也绝不该记 llm.called=True。
+
+    老实现用「客户端是否可用」当 llm.called,导致拒答时误记 true;
+    修复后从 generate() 的 debug['llm_called'] 取真值。
+    """
+    pipeline = make_pipeline(tmp_path, hash_embedder, kb="auditrefuse2")
+    pipeline.add_texts([DOC], source="doc.md")
+    stub = stub_client(reply="不该被调用的回答")
+    monkeypatch.setattr(pipeline, "_llm_client", lambda: stub)
+
+    answer = pipeline.query("公司食堂本周的菜单")
+    assert answer.grounded is False
+    record = read_records(pipeline)[-1]
+    assert record["llm"]["called"] is False
+    assert stub.calls == [], "拒答时不应调用大模型"
+
+
 def test_audit_records_cache_hit(tmp_path, hash_embedder):
     pipeline = make_pipeline(tmp_path, hash_embedder, kb="auditcache", cache_enabled=True)
     pipeline.add_texts([DOC], source="doc.md")
