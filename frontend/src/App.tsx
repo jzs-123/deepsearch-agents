@@ -14,10 +14,10 @@ import { Alert, App as AntApp, Button } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { ChatComposer } from "./components/ChatComposer";
 import { ConversationThread } from "./components/ConversationThread";
-import type { ChatTurn } from "./components/ConversationThread";
 import { API_BASE_URL, WS_BASE_URL } from "./lib/config";
+import { restoreChatTurns } from "./lib/history";
 import { useDeepAgentSession } from "./hooks/useDeepAgentSession";
-import type { ConnectionState, UploadedItem } from "./types";
+import type { ChatTurn, ConnectionState, UploadedItem } from "./types";
 
 function connectionLabel(state: ConnectionState): string {
   const labels: Record<ConnectionState, string> = {
@@ -46,42 +46,37 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [stagedItems, setStagedItems] = useState<UploadedItem[]>([]);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const activeTurnIdRef = useRef<string | null>(null);
   const streamRef = useRef<HTMLElement | null>(null);
   const session = useDeepAgentSession();
 
   useEffect(() => {
+    const activeTurnId = activeTurnIdRef.current;
+    if (!activeTurnId) {
+      if (session.historyMessages.length === 0) {
+        return;
+      }
+      setTurns((previous) => previous.map((turn, index) =>
+        index === previous.length - 1 ? { ...turn, files: session.files } : turn));
+      return;
+    }
     setTurns((previous) => {
-      // ★ 加载历史会话时：events 已恢复但 turns 为空，从 events 重建 turn
-      if (previous.length === 0 && session.events.length > 0) {
-        return [
-          {
-            id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}`,
-            content: "",
+      return previous.map((turn) => turn.id === activeTurnId
+        ? {
+            ...turn,
             events: session.events,
             files: session.files,
-            isRunning: false,
-            result: session.result,
-            timestamp: new Date().toISOString(),
-          },
-        ];
-      }
-
-      if (previous.length === 0) {
-        return previous;
-      }
-
-      const latestTurn = previous[previous.length - 1];
-      const nextLatestTurn = {
-        ...latestTurn,
-        events: session.events,
-        files: session.files,
-        isRunning: session.isRunning,
-        result: session.result
-      };
-
-      return [...previous.slice(0, -1), nextLatestTurn];
+            isRunning: session.isRunning,
+            result: session.result
+          }
+        : turn);
     });
-  }, [session.events, session.files, session.isRunning, session.result]);
+  }, [session.events, session.files, session.historyMessages, session.isRunning, session.result]);
+
+  useEffect(() => {
+    activeTurnIdRef.current = null;
+    setTurns(restoreChatTurns(session.historyMessages));
+  }, [session.historyMessages]);
 
   // 移除自动滚动到底部行为，保留用户当前滚动位置
 
@@ -93,6 +88,7 @@ export default function App() {
     }
 
     const nextTurn = createTurn(cleanQuery);
+    activeTurnIdRef.current = nextTurn.id;
     setTurns((previous) => [...previous, nextTurn]);
     setQuery("");
 
@@ -136,10 +132,20 @@ export default function App() {
   }
 
   function handleNewSession() {
+    activeTurnIdRef.current = null;
     session.resetSession();
     setTurns([]);
     setQuery("");
     setStagedItems([]);
+  }
+
+  async function handleLoadSession(threadId: string) {
+    activeTurnIdRef.current = null;
+    try {
+      await session.loadSessionHistory(threadId);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "历史会话加载失败");
+    }
   }
 
   const online = session.connectionState === "connected";
@@ -216,7 +222,7 @@ export default function App() {
                   }}
                   onClick={() => {
                     if (s.thread_id !== session.threadId) {
-                      session.loadSessionHistory(s.thread_id);
+                      void handleLoadSession(s.thread_id);
                     }
                   }}
                 >

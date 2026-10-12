@@ -8,11 +8,18 @@ Agent 执行过程监控模块
 import asyncio
 import builtins
 import datetime
+from contextvars import ContextVar, Token
 from typing import Any, Optional
 
 from fastapi import WebSocket
 
 from app.api.context import get_thread_context
+
+
+_event_collector: ContextVar[Optional[list[dict[str, Any]]]] = ContextVar(
+    "monitor_event_collector",
+    default=None,
+)
 
 
 class ToolMonitor:
@@ -35,6 +42,13 @@ class ToolMonitor:
         """绑定 FastAPI WebSocket 连接管理器"""
         self.websocket_manager = manager
 
+    def bind_event_collector(self, collector: list[dict[str, Any]]) -> Token:
+        """收集本次 Agent 运行产生的完整事件，供会话历史持久化。"""
+        return _event_collector.set(collector)
+
+    def reset_event_collector(self, token: Token) -> None:
+        _event_collector.reset(token)
+
     def _emit(
         self,
         event_type: str,
@@ -55,6 +69,10 @@ class ToolMonitor:
             "data": data or {},
             "timestamp": datetime.datetime.now().isoformat(),
         }
+
+        collector = _event_collector.get()
+        if collector is not None:
+            collector.append(payload)
 
         if self.websocket_manager:
             try:

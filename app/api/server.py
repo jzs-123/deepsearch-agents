@@ -325,7 +325,12 @@ async def get_session_detail(thread_id: str):
         if not session:
             raise HTTPException(status_code=404, detail="会话不存在")
         messages = get_session_messages(thread_id)
-        return {"session": session, "messages": messages}
+        session_dir = output_dir / f"session_{thread_id}"
+        return {
+            "session": session,
+            "messages": messages,
+            "session_path": str(session_dir) if session_dir.exists() else "",
+        }
     except HTTPException:
         raise
     except Exception as e:

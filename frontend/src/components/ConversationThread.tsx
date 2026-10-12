@@ -17,17 +17,7 @@ import { Button, Tooltip } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { getDownloadUrl } from "../lib/api";
 import { MarkdownRenderer } from "./MarkdownRenderer";
-import type { MonitorMessage, OutputFile } from "../types";
-
-export interface ChatTurn {
-  id: string;
-  content: string;
-  events: MonitorMessage[];
-  files: OutputFile[];
-  isRunning: boolean;
-  result: string;
-  timestamp: string;
-}
+import type { ChatTurn, MonitorMessage, OutputFile } from "../types";
 
 interface ConversationThreadProps {
   onUseExample: (prompt: string) => void;

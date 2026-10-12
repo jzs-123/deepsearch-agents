@@ -153,6 +153,7 @@ async def run_deep_agent(task_query: str, session_id: str, identity: Identity | 
     cancelled = False
     collected_events: list[dict] = []
     final_result = ""
+    event_collector_token = monitor.bind_event_collector(collected_events)
 
     try:
         with task_timer():
@@ -170,38 +171,29 @@ async def run_deep_agent(task_query: str, session_id: str, identity: Identity | 
                                         subagent_type = tool_call["args"]["subagent_type"]
                                         subagent_desc = tool_call["args"]["description"]
                                         monitor.report_assistant(subagent_type, {"description": subagent_desc})
-                                        collected_events.append({
-                                            "event": "assistant_call",
-                                            "message": f"正在调用助手: {subagent_type}",
-                                            "data": {"assistant_name": subagent_type, "args": {"description": subagent_desc}},
-                                        })
                             elif last_msg.content:
                                 final_result = last_msg.content
                                 logger.info("主智能体执行结果: %s", last_msg.content[:100])
                                 monitor.report_task_result(last_msg.content)
-                                collected_events.append({
-                                    "event": "task_result",
-                                    "message": "任务执行完成",
-                                    "data": {"result": last_msg.content},
-                                })
 
     except asyncio.CancelledError:
         cancelled = True
         mark_task_cancelled()
-        save_message(session_id, "system", "任务已被用户取消", json.dumps(collected_events, ensure_ascii=False))
+        save_message(session_id, "system", "任务已被用户取消", json.dumps(collected_events, ensure_ascii=False, default=str))
         logger.info("会话 %s 已被取消", session_id)
         raise
     except Exception as e:
         if not cancelled:
             mark_task_failed()
             error_msg = f"执行主智能发生异常信息：{str(e)}"
-            save_message(session_id, "system", error_msg, json.dumps(collected_events, ensure_ascii=False))
+            save_message(session_id, "system", error_msg, json.dumps(collected_events, ensure_ascii=False, default=str))
             monitor._emit("error", error_msg)
             logger.exception("会话 %s 执行异常", session_id)
     else:
         # 正常完成:保存助手最终响应(带真实内容,供历史重放使用)
-        save_message(session_id, "assistant", final_result, json.dumps(collected_events, ensure_ascii=False))
+        save_message(session_id, "assistant", final_result, json.dumps(collected_events, ensure_ascii=False, default=str))
     finally:
+        monitor.reset_event_collector(event_collector_token)
         reset_session_context(session_dir_token, session_id_token)
         reset_identity_context(identity_token)
         reset_thread_id(log_token)

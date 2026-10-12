@@ -79,9 +79,20 @@ export interface SessionMessage {
 export interface SessionDetail {
   session: SessionSummary;
   messages: SessionMessage[];
+  session_path?: string;
 }
 
 export interface SessionListResponse {
   sessions: SessionSummary[];
   error?: string;
+}
+
+export interface ChatTurn {
+  id: string;
+  content: string;
+  events: MonitorMessage[];
+  files: OutputFile[];
+  isRunning: boolean;
+  result: string;
+  timestamp: string;
 }

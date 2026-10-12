@@ -14,6 +14,7 @@ import type {
   ConnectionState,
   MonitorMessage,
   OutputFile,
+  SessionMessage,
   SessionSummary,
   SocketMessage,
   UploadedItem
@@ -27,6 +28,7 @@ function extractString(data: Record<string, unknown>, key: string): string | nul
 }
 
 export function useDeepAgentSession() {
+  const initialThreadIdRef = useRef(getStoredThreadId());
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | undefined>(undefined);
   const heartbeatTimerRef = useRef<number | undefined>(undefined);
@@ -44,6 +46,7 @@ export function useDeepAgentSession() {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadedItems, setUploadedItems] = useState<UploadedItem[]>([]);
   const [sessionList, setSessionList] = useState<SessionSummary[]>([]);
+  const [historyMessages, setHistoryMessages] = useState<SessionMessage[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
 
   const clearSocketTimers = useCallback(() => {
@@ -67,6 +70,7 @@ export function useDeepAgentSession() {
     setResult("");
     setLastError("");
     setUploadedItems([]);
+    setHistoryMessages([]);
     uploadedNameSetRef.current.clear();
     setIsRunning(false);
     setIsCancelling(false);
@@ -138,6 +142,11 @@ export function useDeepAgentSession() {
             setResult(finalResult || payload.message);
             setIsRunning(false);
             setIsCancelling(false);
+            void fetchSessionList().then((response) => {
+              if (!response.error) {
+                setSessionList(response.sessions || []);
+              }
+            }).catch(() => undefined);
           }
 
           if (payload.event === "task_cancelled") {
@@ -296,36 +305,34 @@ export function useDeepAgentSession() {
 
   // ─── 历史会话管理 ──────────────────────────────────────
 
-  const loadSessionList = useCallback(async () => {
+  const loadSessionList = useCallback(async (): Promise<SessionSummary[]> => {
     try {
       const response = await fetchSessionList();
       if (!response.error) {
-        setSessionList(response.sessions || []);
+        const sessions = response.sessions || [];
+        setSessionList(sessions);
+        return sessions;
       }
     } catch {
       // 静默处理，历史列表加载失败不影响主流程
     }
+    return [];
   }, []);
 
   const loadSessionHistory = useCallback(async (targetThreadId: string) => {
     setIsLoadingHistory(true);
     try {
       const response = await fetchSessionDetail(targetThreadId);
-      // 从历史消息重建事件列表
-      const restoredEvents: MonitorMessage[] = [];
-      for (const msg of response.messages) {
-        try {
-          const parsed = JSON.parse(msg.events_json || "[]") as MonitorMessage[];
-          restoredEvents.push(...parsed);
-        } catch {
-          // 跳过解析失败的事件
-        }
-      }
       storeThreadId(targetThreadId);
       setThreadId(targetThreadId);
-      setEvents(restoredEvents);
+      setHistoryMessages(response.messages);
+      setEvents([]);
+      setFiles([]);
+      setSessionPath(response.session_path || "");
       setResult("");
       setLastError("");
+      setUploadedItems([]);
+      uploadedNameSetRef.current.clear();
       setIsRunning(false);
       setIsCancelling(false);
       return response;
@@ -346,15 +353,25 @@ export function useDeepAgentSession() {
       setSessionPath("");
       setResult("");
       setLastError("");
+      setHistoryMessages([]);
     }
     // 刷新列表
     await loadSessionList();
   }, [loadSessionList, threadId]);
 
-  // 首次加载时拉取历史列表
+  // 首次打开或刷新页面时，恢复 localStorage 中当前会话的完整消息。
   useEffect(() => {
-    loadSessionList();
-  }, [loadSessionList]);
+    let disposed = false;
+    const initialThreadId = initialThreadIdRef.current;
+    void loadSessionList().then((sessions) => {
+      if (!disposed && sessions.some((item) => item.thread_id === initialThreadId)) {
+        void loadSessionHistory(initialThreadId);
+      }
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [loadSessionHistory, loadSessionList]);
 
   const stats = useMemo(() => {
     const toolEvents = events.filter((event) => event.event === "tool_start").length;
@@ -374,6 +391,7 @@ export function useDeepAgentSession() {
     deleteSession,
     events,
     files,
+    historyMessages,
     isCancelling,
     isLoadingHistory,
     isRunning,
