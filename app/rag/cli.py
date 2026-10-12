@@ -117,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p_ingest)
     add_cache_args(p_ingest)
     p_ingest.add_argument("-p", "--path", required=True, help="文件或目录路径")
+    p_ingest.add_argument(
+        "--document-key",
+        default=None,
+        help="单文件的稳定业务身份；再次使用同一值会整篇替换旧版本",
+    )
+    p_ingest.add_argument("--revision-id", default=None, help="单文件版本标识，默认取内容指纹")
+    p_ingest.add_argument("--effective-from", default=None, help="单文件业务生效时间，仅作为元数据保存")
     p_ingest.add_argument("--json", action="store_true")
 
     p_search = sub.add_parser("search", help="检索(不调用大模型)")
@@ -244,7 +251,20 @@ def cmd_create(args) -> int:
 def cmd_ingest(args) -> int:
     config = _build_config(args)
     pipeline = get_pipeline(kb=args.kb, config=config)
-    report = pipeline.ingest(args.path)
+    if Path(args.path).is_dir() and any(
+        (args.document_key, args.revision_id, args.effective_from)
+    ):
+        print(
+            "参数错误:--document-key/--revision-id/--effective-from 只适用于单文件入库",
+            file=sys.stderr,
+        )
+        return 2
+    report = pipeline.ingest(
+        args.path,
+        document_key=args.document_key,
+        revision_id=args.revision_id,
+        effective_from=args.effective_from,
+    )
     if args.json:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     else:

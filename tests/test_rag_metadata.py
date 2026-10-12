@@ -281,7 +281,11 @@ def test_ingest_warns_on_invalid_frontmatter_without_failing(pipeline, tmp_path)
 def test_add_texts_gets_file_level_metadata(pipeline):
     pipeline.add_texts(["风控准确率为 91.5%。"], source="manual.md")
     chunk = pipeline.store.all_chunks()[0]
-    assert chunk.metadata == {"file": "manual.md", "path": "manual.md"}
+    assert chunk.metadata["file"] == "manual.md"
+    assert chunk.metadata["path"] == "manual.md"
+    assert chunk.metadata["document_key"] == "manual.md"
+    assert chunk.metadata["revision_id"]
+    assert chunk.metadata["content_hash"]
 
 
 # ── 4. 检索过滤 ─────────────────────────────────────────────────────

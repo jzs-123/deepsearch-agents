@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 #: 文件级元数据键;frontmatter 里出现同名键时会被忽略(避免和系统字段打架)
 RESERVED_KEYS = ("file", "path", "suffix", "mtime", "size")
+# 由入库流程维护的内部字段。它们仍可用于显式过滤和审计，但不出现在面向用户的
+# “可过滤业务字段”清单里，也不会污染已有部门/类型等字段展示。
+INTERNAL_KEYS = ("document_key", "revision_id", "content_hash", "effective_from")
 
 #: frontmatter 最大行数/字符数:超过就认为这不是 frontmatter(防止把整篇文档当 YAML 解析)
 MAX_FRONTMATTER_LINES = 100
@@ -56,7 +59,8 @@ class MetadataResult:
     @property
     def filter_fields(self) -> list[str]:
         """可用于过滤的字段名(去掉系统保留字段,frontmatter 字段优先展示)。"""
-        return sorted(k for k in self.fields if k not in RESERVED_KEYS)
+        hidden = set(RESERVED_KEYS) | set(INTERNAL_KEYS)
+        return sorted(k for k in self.fields if k not in hidden)
 
 
 def _load_yaml(text: str) -> Any:
@@ -328,7 +332,7 @@ def filter_fields_of(chunks: list) -> list[str]:
         metadata = getattr(chunk, "metadata", None) or {}
         if isinstance(metadata, dict):
             fields.update(str(key) for key in metadata)
-    return sorted(fields - set(RESERVED_KEYS))
+    return sorted(fields - set(RESERVED_KEYS) - set(INTERNAL_KEYS))
 
 
 def format_filter_hint(normalized: dict[str, list[str]], available: list[str]) -> str:
@@ -344,6 +348,7 @@ def format_filter_hint(normalized: dict[str, list[str]], available: list[str]) -
 
 __all__ = [
     "RESERVED_KEYS",
+    "INTERNAL_KEYS",
     "MetadataResult",
     "InvalidFilterError",
     "split_frontmatter",

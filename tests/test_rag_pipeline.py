@@ -94,6 +94,17 @@ def test_add_texts_is_idempotent(pipeline):
     assert len(pipeline.store) == first, "重复写入同一文本不应产生重复候选"
 
 
+def test_add_texts_same_source_replaces_changed_content(pipeline):
+    pipeline.add_texts(["旧规定：学生十五点放学。"], source="放学时间.md")
+    pipeline.add_texts(["新规定：学生十六点放学。"], source="放学时间.md")
+
+    chunks = list(pipeline.store.all_chunks())
+    assert chunks
+    assert all("十五点" not in chunk.text for chunk in chunks)
+    assert any("十六点" in chunk.text for chunk in chunks)
+    assert {chunk.metadata["document_key"] for chunk in chunks} == {"放学时间.md"}
+
+
 def test_add_texts_skips_blank_input(pipeline):
     assert pipeline.add_texts(["   ", "\n"]) == 0
     assert len(pipeline.store) == 0
@@ -211,6 +222,54 @@ def test_ingest_same_file_twice_replaces_instead_of_appending(pipeline, tmp_path
     assert second.total_chunks == first.total_chunks
     assert second.chunks_replaced > 0
     assert len(pipeline.store) == first.total_chunks
+
+
+def test_ingest_changed_file_same_path_replaces_old_version(pipeline, tmp_path):
+    doc = tmp_path / "放学时间.md"
+    doc.write_text("旧规定：学生十五点放学。", encoding="utf-8")
+    pipeline.ingest(doc)
+
+    doc.write_text("新规定：学生十六点放学。", encoding="utf-8")
+    report = pipeline.ingest(doc)
+
+    chunks = list(pipeline.store.all_chunks())
+    assert report.chunks_replaced > 0
+    assert all("十五点" not in chunk.text for chunk in chunks)
+    assert any("十六点" in chunk.text for chunk in chunks)
+    assert {chunk.metadata["document_key"] for chunk in chunks} == {"放学时间.md"}
+
+
+def test_ingest_document_key_replaces_renamed_file(pipeline, tmp_path):
+    old = tmp_path / "放学时间通知.txt"
+    old.write_text("旧规定：学生十五点放学。", encoding="utf-8")
+    pipeline.ingest(old, document_key="school-dismissal-time", revision_id="rev-1")
+
+    new = tmp_path / "冬季作息调整.txt"
+    new.write_text("新规定：学生十六点放学。", encoding="utf-8")
+    report = pipeline.ingest(
+        new,
+        document_key="school-dismissal-time",
+        revision_id="rev-2",
+        effective_from="2026-11-01",
+    )
+
+    chunks = list(pipeline.store.all_chunks())
+    assert report.chunks_replaced > 0
+    assert {chunk.source for chunk in chunks} == {"冬季作息调整.txt"}
+    assert {chunk.metadata["document_key"] for chunk in chunks} == {
+        "school-dismissal-time"
+    }
+    assert {chunk.metadata["revision_id"] for chunk in chunks} == {"rev-2"}
+    assert {chunk.metadata["effective_from"] for chunk in chunks} == {"2026-11-01"}
+
+
+def test_ingest_document_key_rejects_directory(pipeline, tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.md").write_text("文档 A", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="只适用于单文件"):
+        pipeline.ingest(docs, document_key="shared-key")
 
 
 def test_ingest_empty_directory_warns(pipeline, tmp_path):

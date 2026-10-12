@@ -49,6 +49,19 @@ from app.rag.vectorstore import EmbeddingMismatchError, open_vectorstore
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_document_key(value: str) -> str:
+    """把业务文档身份规范成稳定值；路径分隔符和大小写不影响身份。"""
+    key = str(value or "").strip().replace("\\", "/").casefold()
+    if not key:
+        raise ValueError("document_key 不能为空")
+    return key
+
+
+def _document_id(document_key: str) -> str:
+    """从稳定业务身份生成存储层 doc_id，与会变化的正文内容解耦。"""
+    return content_fingerprint(f"document-key:{_normalize_document_key(document_key)}")
+
 #: 多查询融合时,非原始查询的变体权重折扣(原始查询权重要略高,避免被变体挤掉)
 VARIANT_DISCOUNT = 0.85
 
@@ -156,16 +169,36 @@ class RagPipeline:
 
     # ────────────────────────── 入库 ──────────────────────────
 
-    def ingest(self, path: str | Path) -> IngestReport:
+    def ingest(
+        self,
+        path: str | Path,
+        *,
+        document_key: str | None = None,
+        revision_id: str | None = None,
+        effective_from: str | None = None,
+    ) -> IngestReport:
         """把一个文件或目录入库。
 
-        同名文件重复入库会先按 doc_id 删除旧版本再写入新版本(整篇替换),
-        避免「文档更新后新旧内容同时在库里」导致检索到过期信息。
+        文档身份优先取显式 ``document_key``，其次取 frontmatter 中的同名字段，
+        最后自动使用相对路径。同一身份的新内容会整篇替换旧版本，避免检索到过期信息。
+        显式版本参数只适用于单文件；目录中的不同文档可分别在 frontmatter 声明。
         """
         started = time.time()
         root = Path(path)
         if not root.exists():
             raise FileNotFoundError(f"路径不存在:{root}")
+
+        explicit_metadata = {
+            key: value
+            for key, value in {
+                "document_key": document_key,
+                "revision_id": revision_id,
+                "effective_from": effective_from,
+            }.items()
+            if value is not None
+        }
+        if root.is_dir() and explicit_metadata:
+            raise ValueError("document_key/revision_id/effective_from 只适用于单文件入库")
 
         base_dir = root if root.is_dir() else root.parent
         files = iter_supported_files(root)
@@ -175,6 +208,8 @@ class RagPipeline:
 
         pending_chunks: list[Chunk] = []
         pending_texts: list[str] = []
+        pending_replacements: list[tuple[dict, set[str]]] = []
+        pending_document_keys: set[str] = set()
 
         for file_path in files:
             try:
@@ -191,11 +226,35 @@ class RagPipeline:
 
             # 元数据:文件级(名称/路径/后缀/修改时间/大小)+ 内容级(Markdown YAML frontmatter)。
             # frontmatter 会从正文里剥掉——它是元数据,不是正文,留在正文里既污染检索也会挤占 chunk。
-            meta_result = extract_metadata(file_path, doc.text, base_dir=base_dir)
+            meta_result = extract_metadata(
+                file_path,
+                doc.text,
+                base_dir=base_dir,
+                extra=explicit_metadata,
+            )
             for warning in meta_result.warnings:
                 report.warnings.append(f"{file_path.name}:{warning}")
             if meta_result.stripped:
                 doc = replace(doc, text=meta_result.body)
+
+            logical_key = _normalize_document_key(
+                meta_result.fields.get("document_key") or doc.source_path
+            )
+            if logical_key in pending_document_keys:
+                raise ValueError(f"一次入库中出现重复 document_key:{logical_key}")
+            pending_document_keys.add(logical_key)
+
+            content_hash = content_fingerprint(doc.text)
+            current_revision = str(
+                meta_result.fields.get("revision_id") or content_hash[:12]
+            ).strip()
+            meta_result.fields.update(
+                {
+                    "document_key": logical_key,
+                    "revision_id": current_revision,
+                    "content_hash": content_hash,
+                }
+            )
 
             chunks = chunk_document(
                 doc,
@@ -207,31 +266,43 @@ class RagPipeline:
                 report.warnings.append(f"跳过 {file_path.name}:切块结果为空")
                 continue
 
-            # 元数据挂到每个 chunk 上,随 chunks.jsonl 一起持久化
+            stable_doc_id = _document_id(logical_key)
+            # 元数据挂到每个 chunk 上,随 chunks.jsonl 一起持久化。
             for chunk in chunks:
+                chunk.doc_id = stable_doc_id
                 chunk.metadata = dict(meta_result.fields)
 
-            # 整篇替换:同一 doc_id 的旧 chunk 先删掉
-            replaced = self.store.delete_document(chunks[0].doc_id)
-            report.chunks_replaced += replaced
+            # 兼容旧库：旧实现的 doc_id 是内容哈希。第一次按新规则更新时，同时根据
+            # 已有 document_key 或相对路径找出旧 doc_id，确保旧版本不会残留。
+            replacement_ids = {stable_doc_id}
+            for old in self.store.all_chunks():
+                old_key = (old.metadata or {}).get("document_key")
+                if old_key:
+                    matches = _normalize_document_key(old_key) == logical_key
+                else:
+                    matches = _normalize_document_key(old.source_path) == logical_key
+                if matches and old.doc_id:
+                    replacement_ids.add(old.doc_id)
 
             pending_chunks.extend(chunks)
             pending_texts.extend(chunk.text for chunk in chunks)
             report.files_indexed += 1
-            report.details.append(
-                {
-                    "file": doc.source_path,
-                    "chars": doc.char_count,
-                    "chunks": len(chunks),
-                    "replaced": replaced,
-                    "title": doc.title,
-                    # 文本来源(text_layer/ocr/mixed/none):排障时用于判断该文件的正文
-                    # 是原文还是 OCR 识别结果(OCR 会带错字,见 docs/rag-ocr.md)
-                    "extraction": doc.extraction,
-                    # 该文件携带的可过滤字段(frontmatter 字段名,便于入库时人工核对)
-                    "filter_fields": meta_result.filter_fields,
-                }
-            )
+            detail = {
+                "file": doc.source_path,
+                "chars": doc.char_count,
+                "chunks": len(chunks),
+                "replaced": 0,
+                "title": doc.title,
+                "document_key": logical_key,
+                "revision_id": current_revision,
+                # 文本来源(text_layer/ocr/mixed/none):排障时用于判断该文件的正文
+                # 是原文还是 OCR 识别结果(OCR 会带错字,见 docs/rag-ocr.md)
+                "extraction": doc.extraction,
+                # 该文件携带的可过滤字段(frontmatter 字段名,便于入库时人工核对)
+                "filter_fields": meta_result.filter_fields,
+            }
+            report.details.append(detail)
+            pending_replacements.append((detail, replacement_ids))
             for warning in doc.warnings:
                 report.warnings.append(f"{file_path.name}:{warning}")
 
@@ -246,6 +317,11 @@ class RagPipeline:
                 "misses": self.cache.stats.embedding_misses - misses_before,
                 "texts": len(pending_texts),
             }
+            # 新内容已成功解析和向量化后再删除旧版本，避免前置步骤失败导致当前版本丢失。
+            for detail, replacement_ids in pending_replacements:
+                replaced = sum(self.store.delete_document(doc_id) for doc_id in replacement_ids)
+                detail["replaced"] = replaced
+                report.chunks_replaced += replaced
             report.chunks_added = self.store.add(
                 pending_chunks, vectors, embedding_fingerprint=self.embedder.fingerprint
             )
@@ -287,6 +363,9 @@ class RagPipeline:
         """
         chunks: list[Chunk] = []
         combined = "\n\n".join(texts)
+        logical_key = _normalize_document_key(source)
+        stable_doc_id = _document_id(logical_key)
+        content_hash = content_fingerprint(combined)
         for index, text in enumerate(texts):
             text = text.strip()
             if not text:
@@ -301,15 +380,31 @@ class RagPipeline:
             # 多个输入文本时把序号前缀让开,避免 chunk_id 冲突
             for offset, chunk in enumerate(chunked):
                 chunk.chunk_index = index * 1000 + offset
-                chunk.doc_id = content_fingerprint(combined)
+                chunk.doc_id = stable_doc_id
                 # 手工写入的文本没有文件级元数据,只留来源(过滤时仍可按 path/file 用)
-                chunk.metadata = {"file": source, "path": source}
+                chunk.metadata = {
+                    "file": source,
+                    "path": source,
+                    "document_key": logical_key,
+                    "revision_id": content_hash[:12],
+                    "content_hash": content_hash,
+                }
                 chunks.append(chunk)
         if not chunks:
             return 0
-        # 与文件入库保持一致:先按 doc_id 清掉同一份文本的旧版本,避免重复写入
-        self.store.delete_document(content_fingerprint(combined))
         vectors = self._encode_documents([c.text for c in chunks])
+        # 与文件入库保持一致：向量化成功后再清掉同一来源的旧版本。
+        replacement_ids = {stable_doc_id}
+        for old in self.store.all_chunks():
+            old_key = (old.metadata or {}).get("document_key")
+            if old_key:
+                matches = _normalize_document_key(old_key) == logical_key
+            else:
+                matches = _normalize_document_key(old.source_path) == logical_key
+            if matches and old.doc_id:
+                replacement_ids.add(old.doc_id)
+        for doc_id in replacement_ids:
+            self.store.delete_document(doc_id)
         added = self.store.add(chunks, vectors, embedding_fingerprint=self.embedder.fingerprint)
         self.store.meta.update(
             {
