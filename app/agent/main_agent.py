@@ -15,6 +15,7 @@ import json
 import shutil
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
@@ -73,8 +74,14 @@ def file_backend(_runtime):
 # 2. subagents 放网络、数据库、自研 RAG 知识库三类信息获取助手
 # 3. store 注入持久化长期记忆,checkpointer 仅用于单次运行的运行态
 # 4. backend+skills 让主智能体按需加载 app/skills 下的领域方法论
+main_model = model
+if urlparse(settings.openai_base_url).hostname == "api.deepseek.com":
+    # DeepSeek 思考模式拒绝 ToolStrategy 的 required 工具选择。
+    main_model = model.model_copy(update={
+        "extra_body": {**(getattr(model, "extra_body", None) or {}), "thinking": {"type": "disabled"}},
+    })
 main_agent = create_deep_agent(
-    model=model,
+    model=main_model,
     system_prompt=main_agent_content["system_prompt"],
     tools=[generate_markdown, convert_md_to_pdf, read_file_content, save_memory, recall_memory, forget_memory],
     checkpointer=InMemorySaver(),

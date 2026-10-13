@@ -41,3 +41,7 @@ Agent 异常会向包装层重新抛出，失败不会再保存空助手回答�
 完整后端回归 `643 passed, 4 skipped`，前端事件去重、结果版本兼容及终态测试 `4 passed`，生产构建通过。跳过项需要真实外部服务或指定运行环境。
 
 隔离数据库和假模型的浏览器验证：执行中刷新仍显示研搜中，恢复工具事件；任务完成后显示最终回答并回到待命。测试未调用真实 LLM、网络搜索或数据库查询。
+
+追加真实接口验证：DeepSeek 的思考模式会拒绝结构化输出使用的 `tool_choice=required`，造成所有任务在首个模型请求返回 400。主 Agent 在官方 DeepSeek 接口的结构化调用中关闭思考模式，仍保留严格 Schema 与纠错预算。限制见 [DeepSeek 接口说明](https://api-docs.deepseek.com/zh-cn/api/create-chat-completion/)。
+
+修复后，使用当前真实模型完成最小计算任务；通过运行中的前端代理提交，任务状态为 `succeeded`，结果为 `schema_version=2.0`、`2 + 2 = 4`，浏览器中历史与回答正常显示。Agent/API/结果专项回归 `30 passed`，新增 MockTransport 用例覆盖服务端 400 限制。此次没有运行真实网络搜索、业务数据库或私人知识库问题。
