@@ -91,3 +91,26 @@ Thumbs.db
 
 # t14 探针残留(沙箱无法物理删除,忽略之)
 app/rag/_write_probe.py
+frontend/.test-build/
+
+.env.*
+!.env.example
+
+# 运行数据库及 SQLite 附属文件
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# 知识库数据，仅保留说明
+/rag_data/*
+!/rag_data/README.md
+
+# 用户自备资料，仅允许说明文件
+/docs/knowledge_base/*
+!/docs/knowledge_base/README.md
+
+# 私人开发记录与评测数据
+/.workbuddy/
+/examples/ragas_eval_set_mine.json
