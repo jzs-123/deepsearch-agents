@@ -252,10 +252,10 @@ def test_reasoning_exhausts_tokens_retries_with_larger_budget():
     client = ChatClient(model="deepseek-v4-pro", api_key="sk-test", base_url="http://localhost")
     client._client = _FakeOpenAI([
         _FakeResponse([_FakeChoice("", "length")]),          # 第一次:思考耗尽,正文为空
-        _FakeResponse([_FakeChoice("孙子杰的项目是深度研搜平台[1]。", "stop")]),  # 重试成功
+        _FakeResponse([_FakeChoice("张三的项目是深度研搜平台[1]。", "stop")]),  # 重试成功
     ])
     text = client.complete("system", "user", max_tokens=1200)
-    assert text == "孙子杰的项目是深度研搜平台[1]。"
+    assert text == "张三的项目是深度研搜平台[1]。"
     assert client._client.chat.completions.requested_max_tokens == [1200, 4800]
 
 

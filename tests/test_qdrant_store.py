@@ -156,6 +156,15 @@ def _make_store(tmp_path, fake_client, monkeypatch, fingerprint: str | None = No
 # ────────────────────────── 写入与幂等 ──────────────────────────
 
 
+def test_remote_collection_separates_same_named_tenant_libraries(tmp_path):
+    from app.rag.qdrant_store import QdrantStore
+
+    first = QdrantStore(tmp_path / "a" / "finance", url="http://localhost:6333")
+    second = QdrantStore(tmp_path / "b" / "finance", url="http://localhost:6333")
+    assert first.collection_name != second.collection_name
+    assert first.collection_name == QdrantStore(first.path, url=first.url).collection_name
+
+
 def test_add_and_all_chunks_roundtrip(tmp_path, monkeypatch):
     fake = _install_fake_qdrant(monkeypatch)
     store = _make_store(tmp_path, fake, monkeypatch)

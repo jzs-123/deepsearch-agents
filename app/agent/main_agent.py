@@ -19,6 +19,10 @@ from pathlib import Path
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain.agents.structured_output import ToolStrategy
+from app.agent.result import AgentResult, StructuredResultError, retry_structure, structure_retry_budget
+from app.core.config import settings
+from app.utils.path_utils import resolve_path
 
 from app.agent.llm import model
 from app.agent.prompts import main_agent_content
@@ -26,6 +30,7 @@ from app.agent.subagents.database_query_agent import database_query_agent
 from app.agent.subagents.knowledge_base_agent import knowledge_base_agent
 from app.agent.subagents.network_search_agent import network_search_agent
 from app.api.context import (
+    get_session_context,
     reset_session_context,
     set_session_context,
     set_thread_context,
@@ -56,8 +61,12 @@ project_root_path = Path(__file__).parents[1].resolve()
 
 # Skill 通过 FilesystemBackend 从 app/skills 目录按需加载(渐进式披露):
 # 先注入各技能的 name/description,模型判断触发后再读取完整 SKILL.md。
-# virtual_mode=True 把内置文件工具约束在项目根目录内,避免越界读写。
-file_backend = FilesystemBackend(root_dir=project_root_path, virtual_mode=True)
+# virtual_mode=True 把内置文件工具约束在当前会话目录内,避免越界读写。
+def file_backend(_runtime):
+    session_dir = get_session_context()
+    if not session_dir:
+        raise RuntimeError("Agent 文件访问缺少会话上下文")
+    return FilesystemBackend(root_dir=session_dir, virtual_mode=True)
 
 # 主智能体是调度中心:
 # 1. tools 放文件交付工具 + 长期记忆工具(模型可主动记忆/回忆/遗忘)
@@ -73,6 +82,7 @@ main_agent = create_deep_agent(
     backend=file_backend,
     skills=["skills"],
     subagents=[database_query_agent, network_search_agent, knowledge_base_agent],
+    response_format=ToolStrategy(AgentResult, handle_errors=retry_structure),
 )
 
 
@@ -94,9 +104,10 @@ async def run_deep_agent(task_query: str, session_id: str, identity: Identity | 
     # 每个会话独立使用 output/session_{session_id},避免不同用户的产物互相覆盖
     session_dir = project_root_path / "output" / f"session_{session_id}"
     session_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(project_root_path / "skills", session_dir / "skills", dirs_exist_ok=True)
 
     session_dir_str = str(session_dir).replace("\\", "/")
-    relative_session_dir_str = str(session_dir.relative_to(project_root_path)).replace("\\", "/")
+    relative_session_dir_str = "/"
 
     # 上传文件先落在 updated/session_{session_id},执行前复制到本次 output 工作目录
     updated_dir_path = project_root_path / "updated" / f"session_{session_id}"
@@ -111,15 +122,6 @@ async def run_deep_agent(task_query: str, session_id: str, identity: Identity | 
                 + "\n".join([f"    - {f}" for f in files])
                 + "\n    请优先使用工具(read_file_content)读取并参考这些文件。"
             )
-
-    # 写入 ContextVar,让深层工具无需显式传参也能拿到会话目录、thread_id 与身份
-    session_dir_token = set_session_context(session_dir_str)
-    session_id_token = set_thread_context(session_id)
-    identity_token = set_identity_context(identity)
-    log_token = bind_thread_id(session_id)
-
-    # 前端拿到工作目录后,可以展示本次任务生成的 Markdown/PDF 等产物
-    monitor.report_session_dir(session_dir_str)
 
     # 工作环境指令是运行时动态补充的,约束模型只在当前会话目录读写文件
     path_instruction = f"""
@@ -140,60 +142,103 @@ async def run_deep_agent(task_query: str, session_id: str, identity: Identity | 
     input_messages, context_report = context_manager.assemble(
         session_id, task_query, identity, suffix=path_instruction
     )
-    monitor._emit("context_report", f"上下文装配: 记忆{context_report['memories']}条 历史{context_report['history_turns']}条 裁剪{context_report['trimmed']}条 tokens={context_report['tokens_after']}/{context_report['tokens_before']}")
 
     # 持久化:创建/更新会话记录,保存用户问题(供下次运行重放)
-    upsert_session(session_id, task_query[:80])
-    save_message(session_id, "user", task_query, "[]")
+    upsert_session(session_id, task_query[:80], identity.user_id, identity.tenant_id)
+    save_message(
+        session_id,
+        "user",
+        task_query,
+        "[]",
+        identity.user_id,
+        identity.tenant_id,
+    )
 
     # 每次运行使用独立的运行态 thread_id,历史由上方显式注入,避免与 checkpointer 累积重复
     run_thread_id = f"{session_id}:{uuid.uuid4().hex[:8]}"
-    config = {"configurable": {"thread_id": run_thread_id}}
+    config = {"configurable": {"thread_id": run_thread_id}, "recursion_limit": settings.agent_recursion_limit}
 
-    cancelled = False
     collected_events: list[dict] = []
-    final_result = ""
+    final_result: AgentResult | None = None
+    # 在准备成功后绑定上下文，确保所有绑定都由 finally 清理。
+    session_dir_token = set_session_context(session_dir_str)
+    session_id_token = set_thread_context(session_id)
+    identity_token = set_identity_context(identity)
+    log_token = bind_thread_id(session_id)
     event_collector_token = monitor.bind_event_collector(collected_events)
+    retry_token = structure_retry_budget.set([2])
 
     try:
+        monitor.report_session_dir(session_dir_str)
+        monitor._emit("context_report", f"上下文装配: 记忆{context_report['memories']}条 历史{context_report['history_turns']}条 裁剪{context_report['trimmed']}条 tokens={context_report['tokens_after']}/{context_report['tokens_before']}")
         with task_timer():
             async for chunk in main_agent.astream({"messages": input_messages}, config=config):
                 for node_name, state in chunk.items():
-                    if not state or "messages" not in state:
+                    if not state:
+                        continue
+                    if state.get("structured_response") is not None:
+                        final_result = AgentResult.model_validate(state["structured_response"])
+                    if "messages" not in state:
                         continue
                     messages = state["messages"]
                     if messages and isinstance(messages, list):
                         last_msg = messages[-1]
                         if node_name == "model":
-                            if last_msg.tool_calls:
+                            if getattr(last_msg, "tool_calls", None):
                                 for tool_call in last_msg.tool_calls:
                                     if tool_call["name"] == "task":
                                         subagent_type = tool_call["args"]["subagent_type"]
                                         subagent_desc = tool_call["args"]["description"]
                                         monitor.report_assistant(subagent_type, {"description": subagent_desc})
-                            elif last_msg.content:
-                                final_result = last_msg.content
-                                logger.info("主智能体执行结果: %s", last_msg.content[:100])
-                                monitor.report_task_result(last_msg.content)
+            if not final_result:
+                raise StructuredResultError("Agent 未提交符合 Schema 的最终结果")
+            for artifact in final_result.artifacts:
+                path = Path(resolve_path(artifact.path))
+                if not path.is_file():
+                    raise StructuredResultError("Agent 引用的生成文件不存在")
+                artifact.path = str(path)
 
     except asyncio.CancelledError:
-        cancelled = True
         mark_task_cancelled()
-        save_message(session_id, "system", "任务已被用户取消", json.dumps(collected_events, ensure_ascii=False, default=str))
+        save_message(
+            session_id,
+            "system",
+            "任务执行已停止",
+            json.dumps(collected_events, ensure_ascii=False, default=str),
+            identity.user_id,
+            identity.tenant_id,
+        )
         logger.info("会话 %s 已被取消", session_id)
         raise
-    except Exception as e:
-        if not cancelled:
-            mark_task_failed()
-            error_msg = f"执行主智能发生异常信息：{str(e)}"
-            save_message(session_id, "system", error_msg, json.dumps(collected_events, ensure_ascii=False, default=str))
-            monitor._emit("error", error_msg)
-            logger.exception("会话 %s 执行异常", session_id)
+    except Exception:
+        mark_task_failed()
+        error_msg = "任务执行失败，请稍后重试"
+        save_message(
+            session_id,
+            "system",
+            error_msg,
+            json.dumps(collected_events, ensure_ascii=False, default=str),
+            identity.user_id,
+            identity.tenant_id,
+        )
+        monitor._emit("error", error_msg)
+        logger.exception("会话 %s 执行异常", session_id)
+        raise
     else:
         # 正常完成:保存助手最终响应(带真实内容,供历史重放使用)
-        save_message(session_id, "assistant", final_result, json.dumps(collected_events, ensure_ascii=False, default=str))
+        save_message(
+            session_id,
+            "assistant",
+            final_result.answer,
+            json.dumps(collected_events, ensure_ascii=False, default=str),
+            identity.user_id,
+            identity.tenant_id,
+        )
+        monitor.report_task_result(final_result)
+        return final_result
     finally:
         monitor.reset_event_collector(event_collector_token)
+        structure_retry_budget.reset(retry_token)
         reset_session_context(session_dir_token, session_id_token)
         reset_identity_context(identity_token)
         reset_thread_id(log_token)

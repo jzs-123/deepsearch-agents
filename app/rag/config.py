@@ -54,6 +54,7 @@ class RagConfig:
     sparse_enabled: bool = True
     rerank_mode: str = "lexical"
     min_score: float = 0.2
+    use_calibration: bool = True
 
     # 查询改写(Query Rewrite)
     # 注意:**数据类默认值是 off**,保证直接构造 RagConfig 的调用方(含既有单元测试)行为与改写功能

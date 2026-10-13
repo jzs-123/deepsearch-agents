@@ -9,6 +9,25 @@ from app.rag.loaders import SUPPORTED_SUFFIXES
 
 
 _KB_NAME_RE = re.compile(r"^[\w\-.\u4e00-\u9fff]{1,64}$", re.UNICODE)
+_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+SESSION_UPLOAD_SUFFIXES = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".pdf",
+    ".docx",
+    ".csv",
+    ".xlsx",
+    ".xls",
+}
 
 
 def normalize_kb_name(value: str) -> str:
@@ -19,14 +38,46 @@ def normalize_kb_name(value: str) -> str:
     return name
 
 
-def safe_upload_name(value: str) -> str:
-    """校验上传文件名与格式，防止路径穿越。"""
+def normalize_thread_id(value: str) -> str:
+    """返回可安全用于会话目录名的 thread_id。"""
+    thread_id = str(value or "").strip()
+    if not _THREAD_ID_RE.fullmatch(thread_id):
+        raise ValueError("thread_id 仅支持 1-128 位字母、数字、下划线和短横线")
+    return thread_id
+
+
+def _safe_file_name(value: str) -> str:
     raw = str(value or "").strip()
     name = Path(raw).name
-    if not name or name != raw or raw in {".", ".."}:
+    stem = Path(name).stem.upper()
+    if (
+        not name
+        or name != raw
+        or raw in {".", ".."}
+        or len(name) > 200
+        or name.endswith((".", " "))
+        or any(char in name for char in '<>:"/\\|?*')
+        or any(ord(char) < 32 for char in name)
+        or stem in _WINDOWS_RESERVED_NAMES
+    ):
         raise ValueError("文件名不合法")
+    return name
+
+
+def safe_upload_name(value: str) -> str:
+    """校验上传文件名与格式，防止路径穿越。"""
+    name = _safe_file_name(value)
     if Path(name).suffix.lower() not in SUPPORTED_SUFFIXES:
         supported = "、".join(sorted(SUPPORTED_SUFFIXES))
+        raise ValueError(f"暂不支持 {Path(name).suffix or '无后缀'} 文件，可用格式：{supported}")
+    return name
+
+
+def safe_session_upload_name(value: str) -> str:
+    """校验供 Agent 读取的会话附件名与格式。"""
+    name = _safe_file_name(value)
+    if Path(name).suffix.lower() not in SESSION_UPLOAD_SUFFIXES:
+        supported = "、".join(sorted(SESSION_UPLOAD_SUFFIXES))
         raise ValueError(f"暂不支持 {Path(name).suffix or '无后缀'} 文件，可用格式：{supported}")
     return name
 
@@ -49,4 +100,11 @@ def public_kb_summary(item: dict, backend: str) -> dict:
     }
 
 
-__all__ = ["normalize_kb_name", "safe_upload_name", "public_kb_summary"]
+__all__ = [
+    "SESSION_UPLOAD_SUFFIXES",
+    "normalize_kb_name",
+    "normalize_thread_id",
+    "safe_session_upload_name",
+    "safe_upload_name",
+    "public_kb_summary",
+]

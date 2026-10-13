@@ -36,8 +36,18 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.agent.main_agent import run_deep_agent
-from app.api.knowledge_bases import normalize_kb_name, public_kb_summary, safe_upload_name
+from app.agent.result import AgentResult, StructuredResultError
+from langgraph.errors import GraphRecursionError
+from app.api.access import claim_session, require_session, resolve_owned_output_path, task_key
+from app.api.knowledge_bases import (
+    normalize_kb_name,
+    public_kb_summary,
+    safe_upload_name,
+)
 from app.api.monitor import manager, monitor
+from app.api.uploads import save_session_uploads
+from app.api import task_store
+from app.security.knowledge_bases import knowledge_config, visible_knowledge_bases
 from app.core.config import settings
 from app.core.logging import (
     configure_logging,
@@ -49,7 +59,6 @@ from app.observability.metrics import metrics
 from app.security.auth import AuthError, Identity, resolve_identity
 from app.utils.history_manager import (
     delete_session,
-    get_session,
     get_session_messages,
     list_sessions,
 )
@@ -57,17 +66,30 @@ from app.utils.history_manager import (
 logger = get_logger("api.server")
 
 _started_at = time.time()
+_shutting_down = False
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """服务生命周期入口:绑定事件循环、初始化日志与并发信号量。"""
     configure_logging()
+    global _shutting_down
+    _shutting_down = False
     loop = asyncio.get_running_loop()
     manager.set_loop(loop)
+    task_store.interrupt_unfinished()
     logger.info("服务启动,绑定事件循环: %s", id(loop))
-    yield
-    logger.info("服务关闭")
+    try:
+        yield
+    finally:
+        _shutting_down = True
+        running = list(active_tasks.values())
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+        task_store.interrupt_unfinished()
+        manager.loop = None
+        logger.info("服务关闭")
 
 
 # 当前文件位于 app/api/server.py,运行时目录统一收敛到 app 目录
@@ -89,6 +111,8 @@ kb_upload_dir.mkdir(exist_ok=True)
 
 MAX_KB_FILE_BYTES = 50 * 1024 * 1024
 _kb_ingest_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+_session_upload_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+_task_submit_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 # ─── 中间件 ──────────────────────────────────────────────────
@@ -150,10 +174,10 @@ class RateLimitMiddleware:
         await self.app(scope, receive, send)
 
 
-# 教学项目通常前后端分别本地启动,这里放开跨域以便 Vite 页面直接调用 API
+# 本地前后端分别启动时，只允许配置中的页面来源携带凭证访问 API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -165,7 +189,7 @@ app.add_middleware(RateLimitMiddleware, per_minute=settings.rate_limit_per_minut
 # ─── 任务并发治理 ────────────────────────────────────────────
 
 # 保存 thread_id -> 后台 Agent 任务,用于同一会话任务替换和主动取消
-active_tasks: dict[str, asyncio.Task] = {}
+active_tasks: dict[tuple[str, str, str], asyncio.Task] = {}
 _task_semaphore = asyncio.Semaphore(settings.max_concurrent_tasks)
 
 
@@ -176,10 +200,41 @@ class TaskRequest(BaseModel):
     thread_id: str = None
 
 
-def _forget_task(thread_id: str, task: asyncio.Task) -> None:
+@app.get("/api/auth/status")
+async def auth_status(http_request: Request):
+    try:
+        identity = resolve_identity(http_request.headers)
+    except AuthError:
+        return {"enabled": settings.auth_enabled, "authenticated": False}
+    return {"enabled": settings.auth_enabled, "authenticated": True, "user_id": identity.user_id}
+
+
+class LoginRequest(BaseModel):
+    api_key: str
+
+
+@app.post("/api/auth/login")
+async def login(request: LoginRequest):
+    identity = _resolve_identity({"authorization": f"Bearer {request.api_key}"})
+    response = JSONResponse({"user_id": identity.user_id, "tenant_id": identity.tenant_id})
+    response.set_cookie(
+        "deepsearch_auth", request.api_key, httponly=True,
+        secure=settings.app_env == "prod", samesite="strict", max_age=28800,
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+async def logout():
+    response = JSONResponse({"status": "logged_out"})
+    response.delete_cookie("deepsearch_auth")
+    return response
+
+
+def _forget_task(key: tuple[str, str, str], task: asyncio.Task) -> None:
     """清理已结束任务的登记关系,避免误删同 thread_id 下刚启动的新任务。"""
-    if active_tasks.get(thread_id) is task:
-        active_tasks.pop(thread_id, None)
+    if active_tasks.get(key) is task:
+        active_tasks.pop(key, None)
 
 
 def _resolve_identity(headers) -> Identity:
@@ -190,12 +245,66 @@ def _resolve_identity(headers) -> Identity:
         raise HTTPException(status_code=401, detail=str(e))
 
 
-async def _run_task_safely(query: str, thread_id: str, identity: Identity) -> None:
-    """包装 run_deep_agent,确保任务结束(含异常/取消)后释放并发信号量。"""
+def _report_status(task_id, thread_id, status, **fields):
+    task_store.transition(task_id, status, **fields)
+    monitor._emit("task_status", fields.get("error_message") or f"任务状态: {status}",
+                  {"status": status, **fields}, thread_id=thread_id)
+
+
+async def _run_task_safely(query: str, thread_id: str, identity: Identity, task_id: str) -> None:
+    """落盘后才报告终态；信号量由完成回调释放，覆盖启动前取消。"""
+    token = task_store.current_task_id.set(task_id)
     try:
-        await run_deep_agent(query, thread_id, identity=identity)
+        _report_status(task_id, thread_id, "running")
+        result = await run_deep_agent(query, thread_id, identity=identity)
+        snapshot = task_store.get_task(task_id, identity)
+        if snapshot and snapshot["status"] == "cancelling":
+            _report_status(task_id, thread_id, "cancelled")
+            monitor.report_task_cancelled(thread_id)
+        else:
+            output = result if isinstance(result, AgentResult) else AgentResult(status="success", answer=result)
+            if output.status == "failed":
+                _report_status(task_id, thread_id, "failed", result=output.answer,
+                               output=output.model_dump(), error_code="AGENT_REPORTED_FAILURE",
+                               error_message=output.answer)
+            else:
+                _report_status(task_id, thread_id, "succeeded", result=output.answer, output=output.model_dump())
+    except asyncio.CancelledError:
+        if _shutting_down:
+            _report_status(task_id, thread_id, "interrupted", error_code="SERVICE_SHUTDOWN",
+                           error_message="服务停止，任务已中断，请重新提交")
+        else:
+            _report_status(task_id, thread_id, "cancelled")
+            monitor.report_task_cancelled(thread_id)
+        raise
+    except Exception as exc:
+        logger.exception("任务执行失败 task_id=%s", task_id)
+        timed_out = isinstance(exc, TimeoutError)
+        code = "EXECUTION_TIMEOUT" if timed_out else "AGENT_EXECUTION_FAILED"
+        message = "任务执行超时，请稍后重试" if timed_out else "任务执行失败，请稍后重试"
+        if isinstance(exc, StructuredResultError):
+            code, message = "INVALID_AGENT_RESULT", "回答格式校验失败，请重新提交任务"
+        elif isinstance(exc, GraphRecursionError):
+            code, message = "AGENT_STEP_LIMIT", "任务达到执行步数上限，请缩小问题范围"
+        _report_status(task_id, thread_id, "failed",
+                       error_code=code, error_message=message)
     finally:
-        _task_semaphore.release()
+        task_store.current_task_id.reset(token)
+
+
+def _task_done(key: tuple[str, str, str], task: asyncio.Task, task_id: str, identity: Identity) -> None:
+    _task_semaphore.release()
+    _forget_task(key, task)
+    if not task.cancelled():
+        task.exception()
+    snapshot = task_store.get_task(task_id, identity)
+    if snapshot and snapshot["status"] not in task_store.TERMINAL:
+        # 协程启动前被取消时，包装层的 finally 不会执行。
+        token = task_store.current_task_id.set(task_id)
+        try:
+            _report_status(task_id, key[2], "interrupted" if _shutting_down else "cancelled")
+        finally:
+            task_store.current_task_id.reset(token)
 
 
 @app.post("/api/task")
@@ -207,65 +316,107 @@ async def run_task(request: TaskRequest, http_request: Request):
     答案都会由 monitor 通过 `/ws/{thread_id}` 推送给同一会话的前端。
     """
     identity = _resolve_identity(http_request.headers)
-    thread_id = request.thread_id or str(uuid.uuid4())
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="请输入研搜任务")
+    thread_id = claim_session(request.thread_id or str(uuid.uuid4()), identity)
+    key = task_key(thread_id, identity)
 
-    # 全局并发上限
-    if _task_semaphore.locked():
-        raise HTTPException(status_code=429, detail="并发任务数已达上限,请稍后重试")
-
-    # 同一个 thread_id 只保留一个活跃任务,新任务会先取消旧任务
-    old_task = active_tasks.get(thread_id)
-    if old_task and not old_task.done():
-        old_task.cancel()
-
-    await _task_semaphore.acquire()
-    task = asyncio.create_task(_run_task_safely(request.query, thread_id, identity))
-    active_tasks[thread_id] = task
-    task.add_done_callback(lambda finished_task: _forget_task(thread_id, finished_task))
+    async with _task_submit_locks[thread_id]:
+        old_task = active_tasks.get(key)
+        if old_task and not old_task.done():
+            old_task.cancel()
+            await asyncio.gather(old_task, return_exceptions=True)
+        if _task_semaphore.locked():
+            raise HTTPException(status_code=429, detail="并发任务数已达上限,请稍后重试")
+        await _task_semaphore.acquire()
+        try:
+            task_id = task_store.create_task(thread_id, identity, request.query)
+            task = asyncio.create_task(_run_task_safely(request.query, thread_id, identity, task_id))
+            active_tasks[key] = task
+            task.add_done_callback(lambda finished_task: _task_done(key, finished_task, task_id, identity))
+        except BaseException:
+            _task_semaphore.release()
+            raise
     logger.info("任务已启动 thread_id=%s user=%s", thread_id, identity.user_id)
 
-    return {"status": "started", "thread_id": thread_id}
+    return {"status": "started", "thread_id": thread_id, "task_id": task_id}
 
 
 @app.post("/api/task/{thread_id}/cancel")
-async def cancel_task(thread_id: str):
-    """取消指定 thread_id 对应的后台 Agent 任务(立即通知前端,再注入取消信号)。"""
-    task = active_tasks.get(thread_id)
+async def cancel_task(thread_id: str, http_request: Request):
+    """请求取消；协程真正退出后由包装层报告 cancelled。"""
+    identity = _resolve_identity(http_request.headers)
+    require_session(thread_id, identity)
+    key = task_key(thread_id, identity)
+    task = active_tasks.get(key)
     if not task or task.done():
-        active_tasks.pop(thread_id, None)
+        active_tasks.pop(key, None)
         raise HTTPException(status_code=404, detail="任务不存在或已结束")
 
-    monitor.report_task_cancelled()
-    _forget_task(thread_id, task)
+    snapshot = task_store.latest_task(thread_id, identity)
+    if not snapshot or snapshot["status"] in task_store.TERMINAL:
+        raise HTTPException(status_code=404, detail="任务不存在或已结束")
+    token = task_store.current_task_id.set(snapshot["task_id"])
+    try:
+        if snapshot["status"] != "cancelling":
+            _report_status(snapshot["task_id"], thread_id, "cancelling")
+    finally:
+        task_store.current_task_id.reset(token)
     task.cancel()
 
-    return {"status": "cancelled", "thread_id": thread_id}
+    return {"status": "cancelling", "thread_id": thread_id, "task_id": snapshot["task_id"]}
+
+
+@app.get("/api/tasks/{task_id}")
+async def task_snapshot(task_id: str, http_request: Request):
+    identity = _resolve_identity(http_request.headers)
+    snapshot = task_store.get_task(task_id, identity)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在或无权访问")
+    return snapshot
+
+
+@app.get("/api/tasks/{task_id}/events")
+async def task_events(task_id: str, http_request: Request, after: int = 0):
+    identity = _resolve_identity(http_request.headers)
+    if not task_store.get_task(task_id, identity):
+        raise HTTPException(status_code=404, detail="任务不存在或无权访问")
+    return {"events": task_store.get_events(task_id, max(0, after))}
+
+
+@app.get("/api/sessions/{thread_id}/task")
+async def session_task(thread_id: str, http_request: Request):
+    identity = _resolve_identity(http_request.headers)
+    require_session(thread_id, identity)
+    return {"task": task_store.latest_task(thread_id, identity)}
 
 
 @app.post("/api/upload")
-async def upload_files(files: List[UploadFile] = File(...), thread_id: str = Form(...)):
-    """文件上传接口:按会话隔离保存到 updated/session_{thread_id}。"""
-    target_dir = updated_dir / f"session_{thread_id}"
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    saved_files = []
-    for file in files:
-        file_path = target_dir / file.filename
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        saved_files.append(file.filename)
-
-    return {"status": "uploaded", "files": saved_files}
+async def upload_files(
+    http_request: Request,
+    files: List[UploadFile] = File(...),
+    thread_id: str = Form(...),
+):
+    """文件上传接口:校验后按会话隔离、限量保存到 updated 目录。"""
+    identity = _resolve_identity(http_request.headers)
+    thread_id = claim_session(thread_id, identity)
+    try:
+        async with _session_upload_locks[thread_id]:
+            saved_files = await save_session_uploads(files, thread_id, updated_dir)
+        return {"status": "uploaded", "files": saved_files}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("会话附件上传失败 thread_id=%s", thread_id)
+        raise HTTPException(status_code=500, detail="文件上传失败") from exc
 
 
 @app.get("/api/knowledge-bases")
-async def get_knowledge_bases():
+async def get_knowledge_bases(http_request: Request):
     """列出前端可选择的知识库及规模信息。"""
-    from app.rag.config import load_rag_config
-    from app.rag.vectorstore import list_knowledge_bases
-
-    config = load_rag_config()
-    bases = list_knowledge_bases(config.data_path)
+    identity = _resolve_identity(http_request.headers)
+    config = knowledge_config(identity)
+    bases = visible_knowledge_bases(identity)
     return {
         "default_kb": config.default_kb,
         "knowledge_bases": [public_kb_summary(item, config.vectorstore) for item in bases],
@@ -274,6 +425,7 @@ async def get_knowledge_bases():
 
 @app.post("/api/knowledge-bases/ingest")
 async def ingest_knowledge_base(
+    http_request: Request,
     files: List[UploadFile] = File(...),
     kb_name: str = Form(...),
     document_key: str = Form(""),
@@ -281,6 +433,8 @@ async def ingest_knowledge_base(
     effective_from: str = Form(""),
 ):
     """上传文档并直接入库；同一 document_key 的新版本会替换旧版本。"""
+    identity = _resolve_identity(http_request.headers)
+    config = knowledge_config(identity)
     try:
         safe_kb = normalize_kb_name(kb_name)
         if not files:
@@ -306,11 +460,11 @@ async def ingest_knowledge_base(
                         raise HTTPException(status_code=413, detail=f"{safe_name} 超过 50MB 限制")
                     buffer.write(chunk)
 
-        async with _kb_ingest_locks[safe_kb]:
+        async with _kb_ingest_locks[str(config.kb_dir(safe_kb))]:
             def run_ingest():
                 from app.rag.pipeline import clear_pipeline_cache, get_pipeline
 
-                pipeline = get_pipeline(kb=safe_kb, create=True)
+                pipeline = get_pipeline(kb=safe_kb, config=config, create=True)
                 source = batch_dir / safe_names[0] if len(safe_names) == 1 else batch_dir
                 report = pipeline.ingest(
                     source,
@@ -335,15 +489,10 @@ async def ingest_knowledge_base(
 
 
 @app.get("/api/download")
-async def download_file(path: str):
+async def download_file(path: str, http_request: Request):
     """文件下载接口:严格限制在 output 目录内,防路径穿越。"""
-    try:
-        abs_path = Path(path).resolve()
-        output_abs = output_dir.resolve()
-        if not abs_path.is_relative_to(output_abs):
-            return {"error": "拒绝访问: 只能下载输出目录下的文件"}
-    except Exception:
-        return {"error": "无效的路径参数"}
+    identity = _resolve_identity(http_request.headers)
+    abs_path = resolve_owned_output_path(path, output_dir, identity)
 
     if not abs_path.exists():
         return {"error": "文件不存在"}
@@ -352,15 +501,10 @@ async def download_file(path: str):
 
 
 @app.get("/api/files")
-async def list_files(path: str):
+async def list_files(path: str, http_request: Request):
     """文件列表查询接口:返回 output 目录下的文件元数据。"""
-    try:
-        abs_path = Path(path).resolve()
-        output_abs = output_dir.resolve()
-        if not abs_path.is_relative_to(output_abs):
-            return {"error": "拒绝访问: 只能访问输出目录下的文件"}
-    except Exception as e:
-        return {"error": f"路径无效: {e}"}
+    identity = _resolve_identity(http_request.headers)
+    abs_path = resolve_owned_output_path(path, output_dir, identity)
 
     if not abs_path.exists():
         return {"error": "目录不存在"}
@@ -368,6 +512,8 @@ async def list_files(path: str):
     files = []
     try:
         for file_path in abs_path.rglob("*"):
+            if file_path.relative_to(output_dir).parts[1:2] == ("skills",):
+                continue
             if file_path.is_file():
                 stat = file_path.stat()
                 files.append(
@@ -390,10 +536,11 @@ async def list_files(path: str):
 
 
 @app.get("/api/sessions")
-async def get_sessions():
+async def get_sessions(http_request: Request):
     """历史会话列表接口。"""
+    identity = _resolve_identity(http_request.headers)
     try:
-        sessions = list_sessions(limit=50)
+        sessions = list_sessions(50, identity.user_id, identity.tenant_id)
         return {"sessions": sessions}
     except Exception as e:
         logger.error("获取会话列表失败: %s", e)
@@ -401,13 +548,12 @@ async def get_sessions():
 
 
 @app.get("/api/sessions/{thread_id}")
-async def get_session_detail(thread_id: str):
+async def get_session_detail(thread_id: str, http_request: Request):
     """会话详情接口:返回元数据与所有历史消息。"""
+    identity = _resolve_identity(http_request.headers)
     try:
-        session = get_session(thread_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="会话不存在")
-        messages = get_session_messages(thread_id)
+        session = require_session(thread_id, identity)
+        messages = get_session_messages(thread_id, identity.user_id, identity.tenant_id)
         session_dir = output_dir / f"session_{thread_id}"
         return {
             "session": session,
@@ -422,16 +568,22 @@ async def get_session_detail(thread_id: str):
 
 
 @app.delete("/api/sessions/{thread_id}")
-async def remove_session(thread_id: str):
+async def remove_session(thread_id: str, http_request: Request):
     """删除会话接口:若在运行则先取消,再删除会话及其消息。"""
+    identity = _resolve_identity(http_request.headers)
+    require_session(thread_id, identity)
+    key = task_key(thread_id, identity)
     try:
-        task = active_tasks.get(thread_id)
+        task = active_tasks.get(key)
         if task and not task.done():
-            monitor.report_task_cancelled()
             task.cancel()
-            _forget_task(thread_id, task)
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            _forget_task(key, task)
 
-        deleted = delete_session(thread_id)
+        deleted = delete_session(thread_id, identity.user_id, identity.tenant_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="会话不存在或已删除")
         return {"status": "deleted", "thread_id": thread_id}
@@ -471,6 +623,12 @@ async def get_metrics():
 @app.websocket("/ws/{thread_id}")
 async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     """WebSocket 实时通讯核心接口,按 thread_id 定向推送 monitor 事件。"""
+    try:
+        identity = resolve_identity(websocket.headers)
+        thread_id = claim_session(thread_id, identity)
+    except (AuthError, HTTPException):
+        await websocket.close(code=4401)
+        return
     logger.info("建立 WebSocket 连接: %s", thread_id)
     await manager.connect(websocket, thread_id)
 

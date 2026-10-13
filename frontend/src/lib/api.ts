@@ -7,6 +7,8 @@ import type {
   SessionDetail,
   SessionListResponse,
   TaskResponse,
+  TaskSnapshot,
+  MonitorMessage,
   UploadResponse,
 } from "../types";
 
@@ -15,7 +17,7 @@ function apiUrl(path: string): string {
 }
 
 async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, init);
+  const response = await fetch(input, { ...init, credentials: "include" });
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json")
     ? await response.json()
@@ -30,6 +32,18 @@ async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Pro
   }
 
   return payload as T;
+}
+
+export function fetchAuthStatus(): Promise<{ enabled: boolean; authenticated: boolean; user_id?: string }> {
+  return requestJson(apiUrl("/api/auth/status"));
+}
+
+export function loginWithApiKey(apiKey: string): Promise<{ user_id: string; tenant_id: string }> {
+  return requestJson(apiUrl("/api/auth/login"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ api_key: apiKey }),
+  });
 }
 
 export async function startTask(query: string, threadId: string): Promise<TaskResponse> {
@@ -49,6 +63,14 @@ export async function cancelTask(threadId: string): Promise<CancelTaskResponse> 
   return requestJson<CancelTaskResponse>(apiUrl(`/api/task/${encodeURIComponent(threadId)}/cancel`), {
     method: "POST"
   });
+}
+
+export function fetchLatestTask(threadId: string): Promise<{ task: TaskSnapshot | null }> {
+  return requestJson(apiUrl(`/api/sessions/${encodeURIComponent(threadId)}/task`));
+}
+
+export function fetchTaskEvents(taskId: string, after: number): Promise<{ events: MonitorMessage[] }> {
+  return requestJson(apiUrl(`/api/tasks/${encodeURIComponent(taskId)}/events?after=${after}`));
 }
 
 export async function uploadSessionFiles(

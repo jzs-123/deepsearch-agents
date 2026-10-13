@@ -4,12 +4,15 @@ import {
   deleteSessionApi,
   fetchSessionDetail,
   fetchSessionList,
+  fetchLatestTask,
+  fetchTaskEvents,
   listSessionFiles,
   startTask,
   uploadSessionFiles
 } from "../lib/api";
 import { WS_BASE_URL } from "../lib/config";
 import { createThreadId, getStoredThreadId, storeThreadId } from "../lib/thread";
+import { mergeTaskEvents, taskDisplay, resultAnswer } from "../lib/taskState";
 import type {
   ConnectionState,
   MonitorMessage,
@@ -33,6 +36,10 @@ export function useDeepAgentSession() {
   const reconnectTimerRef = useRef<number | undefined>(undefined);
   const heartbeatTimerRef = useRef<number | undefined>(undefined);
   const uploadedNameSetRef = useRef<Set<string>>(new Set());
+  const taskIdRef = useRef<string | null>(null);
+  const terminalTaskIdRef = useRef<string | null>(null);
+  const replayCursorRef = useRef(0);
+  const requestEpochRef = useRef(0);
   const [threadId, setThreadId] = useState(getStoredThreadId);
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [events, setEvents] = useState<MonitorMessage[]>([]);
@@ -61,6 +68,9 @@ export function useDeepAgentSession() {
   }, []);
 
   const resetSession = useCallback(() => {
+    taskIdRef.current = null;
+    replayCursorRef.current = 0;
+    requestEpochRef.current += 1;
     const nextThreadId = createThreadId();
     storeThreadId(nextThreadId);
     setThreadId(nextThreadId);
@@ -128,7 +138,14 @@ export function useDeepAgentSession() {
             return;
           }
 
-          setEvents((previous) => [...previous, payload].slice(-MAX_EVENTS));
+          if (payload.task_id && payload.task_id !== taskIdRef.current) {
+            return; // 状态查询确认当前任务后，再补发其事件，忽略旧任务的迟到消息。
+          }
+          if (payload.task_id) {
+            setEvents((previous) => mergeTaskEvents(previous, [payload], payload.task_id!));
+          } else {
+            setEvents((previous) => [...previous, payload].slice(-MAX_EVENTS));
+          }
 
           if (payload.event === "session_created") {
             const path = extractString(payload.data, "path");
@@ -138,10 +155,8 @@ export function useDeepAgentSession() {
           }
 
           if (payload.event === "task_result") {
-            const finalResult = extractString(payload.data, "result");
+            const finalResult = resultAnswer(payload.data);
             setResult(finalResult || payload.message);
-            setIsRunning(false);
-            setIsCancelling(false);
             void fetchSessionList().then((response) => {
               if (!response.error) {
                 setSessionList(response.sessions || []);
@@ -157,8 +172,15 @@ export function useDeepAgentSession() {
 
           if (payload.event === "error") {
             setLastError(payload.message);
-            setIsRunning(false);
-            setIsCancelling(false);
+          }
+
+          if (payload.event === "task_status") {
+            const status = extractString(payload.data, "status");
+            const running = ["queued", "running", "cancelling"].includes(status || "");
+            if (!running && payload.task_id) terminalTaskIdRef.current = payload.task_id;
+            if (running && terminalTaskIdRef.current === payload.task_id) return;
+            setIsRunning(running);
+            setIsCancelling(status === "cancelling");
           }
         } catch (error) {
           setLastError(error instanceof Error ? error.message : "WebSocket 消息解析失败");
@@ -194,6 +216,66 @@ export function useDeepAgentSession() {
     };
   }, [clearSocketTimers, threadId]);
 
+  // 快照决定状态，持久事件补齐断线窗口；游标只由有序 HTTP 补发推进。
+  useEffect(() => {
+    let disposed = false;
+    let timer: number;
+    async function recover() {
+      const epoch = requestEpochRef.current;
+      try {
+        const { task } = await fetchLatestTask(threadId);
+        if (disposed || epoch !== requestEpochRef.current || !task) return;
+        if (taskIdRef.current !== task.task_id) {
+          taskIdRef.current = task.task_id;
+          replayCursorRef.current = 0;
+          setEvents([]);
+        }
+        const display = taskDisplay(task);
+        if (!display.isRunning) terminalTaskIdRef.current = task.task_id;
+        if (!display.isRunning || terminalTaskIdRef.current !== task.task_id) {
+          setIsRunning(display.isRunning);
+          setIsCancelling(display.isCancelling);
+        }
+        if (display.result) setResult(display.result);
+        if (display.error) setLastError(display.error);
+        let page: { events: MonitorMessage[] };
+        do {
+          page = await fetchTaskEvents(task.task_id, replayCursorRef.current);
+          if (disposed || epoch !== requestEpochRef.current || taskIdRef.current !== task.task_id) return;
+          const incoming = page.events;
+          setEvents((previous) => mergeTaskEvents(previous, incoming, task.task_id));
+          for (const event of page.events) {
+            replayCursorRef.current = Math.max(replayCursorRef.current, event.seq || 0);
+            if (event.event === "session_created") {
+              const path = extractString(event.data, "path");
+              if (path) setSessionPath(path);
+            }
+            if (event.event === "task_result") {
+              const answer = resultAnswer(event.data);
+              if (answer) setResult(answer);
+            }
+            if (event.event === "task_status" && terminalTaskIdRef.current !== task.task_id) {
+              const status = extractString(event.data, "status") || "";
+              const running = ["queued", "running", "cancelling"].includes(status);
+              if (!running) terminalTaskIdRef.current = task.task_id;
+              setIsRunning(running);
+              setIsCancelling(status === "cancelling");
+              const error = extractString(event.data, "error_message");
+              if (error) setLastError(error);
+              if (status === "cancelled") setResult("任务已取消");
+            }
+          }
+        } while (page.events.length === 500);
+      } catch {
+        // 新会话尚未创建或连接暂时不可用，下次补发继续。
+      } finally {
+        if (!disposed) timer = window.setTimeout(recover, 5000);
+      }
+    }
+    void recover();
+    return () => { disposed = true; window.clearTimeout(timer); };
+  }, [threadId]);
+
   useEffect(() => {
     if (!sessionPath) {
       return;
@@ -220,12 +302,16 @@ export function useDeepAgentSession() {
       }
 
       setIsRunning(true);
+      requestEpochRef.current += 1;
+      taskIdRef.current = null;
+      replayCursorRef.current = 0;
       setIsCancelling(false);
       setEvents([]);
       setResult("");
       setLastError("");
       try {
         const response = await startTask(cleanQuery, threadId);
+        taskIdRef.current = response.task_id;
         if (response.thread_id && response.thread_id !== threadId) {
           storeThreadId(response.thread_id);
           setThreadId(response.thread_id);
@@ -320,6 +406,9 @@ export function useDeepAgentSession() {
   }, []);
 
   const loadSessionHistory = useCallback(async (targetThreadId: string) => {
+    requestEpochRef.current += 1;
+    taskIdRef.current = null;
+    replayCursorRef.current = 0;
     setIsLoadingHistory(true);
     try {
       const response = await fetchSessionDetail(targetThreadId);

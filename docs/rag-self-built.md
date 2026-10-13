@@ -470,7 +470,7 @@ BM25 已经用过词频了，如果词面重排再用一遍词频/覆盖，就�
 
 ### 5.20 推理模型思维链吃光 max_tokens：空 content 被误判成「模型拒答」
 
-**现象**：`ask -k mydocs -q "孙子杰的项目经历"`——检索完全正常（4 chunks 全召回、`gate_score 0.39` 过阈值、`llm_called: true`、耗时 17s），却返回拒答文案，调试信息里 `reason: "model_refused"`。而库内容明确包含"姓名：孙子杰"和两段项目经历。
+**现象**：`ask -k mydocs -q "xxx的项目经历"`——检索完全正常（4 chunks 全召回、`gate_score 0.39` 过阈值、`llm_called: true`、耗时 17s），却返回拒答文案，调试信息里 `reason: "model_refused"`。而库内容明确包含"姓名：xxx"和两段项目经历。
 
 **原因**：`.env` 配置的 `LLM_DEEPSEEK=deepseek-v4-pro` 是**推理模型**：思维链（`reasoning_content`）与正文（`content`）共享同一个 `max_tokens` 预算。上下文复杂/OCR 噪声多时，模型会思考很久——直接调 API 复现：`finish_reason: length`、`reasoning_tokens: 1199/1199`、`content_len: 0`，**1200 个 token 全被思考消耗，正文一个字没生成就被截断**。随后 `generator.py` 的 `text or NO_EVIDENCE_ANSWER` 把空文本替换成拒答模板，模板文案又命中 `_REFUSAL_MARKERS`（"知识库中没有"），被误标为 `model_refused`。同一个小上下文的简单问题则正常（reasoning 仅 92 tokens），所以问题只在"上下文足够复杂时"间歇性出现，极具迷惑性。
 

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -54,7 +55,7 @@ def _embed_input(chunk: Chunk) -> str:
     """向量编码用的文本:heading 前置参与语义编码。
 
     与 BM25 的「标题参与索引」策略对齐(bm25.py 里 tokenize 的输入同样是
-    heading + text):「孙子杰的项目经历」这类 query 能直接命中 heading 含
+    heading + text):「张三的项目经历」这类 query 能直接命中 heading 含
     「项目经历」的 chunk。注意 chunk.text 本身不变——持久化/展示/引用仍是原文。
     """
     if chunk.heading:
@@ -132,6 +133,8 @@ class RagPipeline:
             而不是「库不存在」这个真实原因。
         """
         self.config = config or load_rag_config()
+        self._base_config = self.config
+        self._calibrated_config = self.config
         self.kb = kb or self.config.default_kb
         self.kb_dir = self.config.kb_dir(self.kb)
         self._bm25: BM25Index | None = None
@@ -768,6 +771,18 @@ class RagPipeline:
         :param _record_audit: 内部参数。`query()` 会自己写一条包含生成阶段的审计记录,
             因此调用 search 时把它置 False,避免一次问答产生两条日志
         """
+        from app.rag.calibration import apply_calibration, retrieval_settings
+        if self.config is not self._calibrated_config:
+            self._base_config = self.config
+        self.config, calibration = apply_calibration(
+            self._base_config, self.kb, self.store.meta, self.embedder.fingerprint
+        )
+        self._calibrated_config = self.config
+        # 检索策略和阈值变化只切换结果缓存键，保留内容寻址的 embedding 缓存。
+        self.cache.result_policy = json.dumps({
+            "settings": retrieval_settings(self.config), "threshold": self.config.min_score,
+            "top_k": top_k, "top_n": top_n, "rerank": rerank, "rewrite": rewrite,
+        }, sort_keys=True, ensure_ascii=False)
         top_k = top_k or self.config.top_k
         top_n = top_n or self.config.top_n
         normalized_filter = normalize_filter(filter)
@@ -776,6 +791,7 @@ class RagPipeline:
 
         if not len(self.store):
             self.last_search_debug = {
+                "calibration": calibration,
                 "question": question,
                 "rewrite_mode": self._resolve_rewrite_mode(rewrite),
                 "empty_store": True,
@@ -809,6 +825,7 @@ class RagPipeline:
             if restored is not None:
                 cache_info["hit"] = True
                 self.last_search_debug = {
+                    "calibration": calibration,
                     "question": question,
                     "rewrite_mode": cached_payload.get("rewrite_mode", mode),
                     "variants": cached_payload.get("variants") or [question],
@@ -876,6 +893,7 @@ class RagPipeline:
                     retry["reason"] = "改写未产生新变体,跳过重试"
 
         self.last_search_debug = {
+            "calibration": calibration,
             "question": question,
             "rewrite_mode": mode,
             "variants": list(used_variants),
@@ -1013,6 +1031,7 @@ class RagPipeline:
         answer.debug["elapsed"] = round(time.time() - started, 3)
         # 把改写/重试的审计信息一并带出:只有能看到"改了什么、有没有重试",才谈得上调参
         debug = self.last_search_debug
+        answer.debug["calibration"] = debug.get("calibration")
         answer.debug["rewrite_mode"] = debug.get("rewrite_mode", "off")
         answer.debug["variants"] = debug.get("variants", [])
         answer.debug["retry_triggered"] = bool(debug.get("retry", {}).get("triggered"))
@@ -1163,12 +1182,23 @@ def get_pipeline(
     config = config or load_rag_config()
     kb_name = kb or config.default_kb
     key = (
+        str(config.data_path.resolve()),
         kb_name,
         config.embedding_provider,
         config.embedding_model,
         config.vectorstore,
         config.qdrant_url,
         config.chunk_size,
+        config.chunk_overlap,
+        config.top_k,
+        config.top_n,
+        config.min_score,
+        config.use_calibration,
+        config.rerank_mode,
+        config.query_rewrite,
+        config.query_variants,
+        config.retry_on_low_score,
+        config.rewrite_synonyms,
         config.sparse_enabled,
         config.cache_enabled,
         config.audit_enabled,

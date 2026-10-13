@@ -1,7 +1,7 @@
 """
 身份与多租户隔离模块
 
-从请求头解析用户/租户身份,为记忆、历史与线程 ID 提供命名空间隔离。
+从已校验的 API Key 解析服务端绑定的用户/租户身份。
 AUTH_ENABLED=false 时退化为匿名身份,不破坏现有前端;开启后强制校验 API Key。
 
 用法示例:
@@ -12,7 +12,9 @@ AUTH_ENABLED=false 时退化为匿名身份,不破坏现有前端;开启后强�
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from http.cookies import SimpleCookie
+import hmac
 from typing import Mapping, Optional
 
 from app.core.config import settings
@@ -62,32 +64,42 @@ def resolve_identity(headers: Optional[Mapping[str, str]] = None) -> Identity:
     """
     从请求头解析身份。开启鉴权时校验 API Key,失败抛 AuthError。
 
-    :param headers: 请求头字典,默认从 X-User-Id / X-Tenant-Id / Authorization 解析
+    :param headers: 请求头字典，从 Authorization 或 HttpOnly Cookie 读取凭证
     :return: 解析后的 Identity
     """
-    h = dict(headers or {})
-    user_id = h.get("x-user-id") or "anonymous"
-    tenant_id = h.get("x-tenant-id") or "default"
-    roles = tuple(r for r in (h.get("x-roles") or "").split(",") if r)
+    h = {key.lower(): value for key, value in (headers or {}).items()}
 
     if settings.auth_enabled:
+        origin = h.get("origin")
+        if origin and origin not in settings.cors_origins:
+            raise AuthError("请求来源不允许")
         token = _extract_bearer(h.get("authorization"))
-        if not token or token != settings.auth_api_key:
-            raise AuthError("未授权: API Key 缺失或无效")
-        return Identity(user_id=user_id, tenant_id=tenant_id, roles=roles, authenticated=True)
+        if not token:
+            cookie = SimpleCookie()
+            try:
+                cookie.load(h.get("cookie", ""))
+                item = cookie.get("deepsearch_auth")
+                token = item.value if item else None
+            except Exception:
+                token = None
+        if token:
+            for credential, owner in settings.auth_users.items():
+                if hmac.compare_digest(token.encode(), credential.encode()):
+                    user_id = owner.get("user_id", "")
+                    tenant_id = owner.get("tenant_id", "")
+                    if user_id and tenant_id:
+                        return Identity(user_id=user_id, tenant_id=tenant_id, authenticated=True)
+                    raise AuthError("服务端用户身份配置不完整")
+            if settings.auth_api_key and hmac.compare_digest(token.encode(), settings.auth_api_key.encode()):
+                return Identity(user_id="anonymous", tenant_id="default", authenticated=True)
+        raise AuthError("未授权: API Key 缺失或无效")
 
-    # 未开启鉴权:显式携带身份头视为已认证,否则匿名
-    return Identity(
-        user_id=user_id,
-        tenant_id=tenant_id,
-        roles=roles,
-        authenticated=bool(h.get("x-user-id")),
-    )
+    return Identity(user_id="anonymous", tenant_id="default")
 
 
 def user_namespace(identity: Identity) -> tuple[str, ...]:
     """当前用户的记忆命名空间前缀。"""
-    return ("user", identity.user_id)
+    return ("tenant", identity.tenant_id, "user", identity.user_id)
 
 
 def tenant_namespace(identity: Identity) -> tuple[str, ...]:

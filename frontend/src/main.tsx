@@ -3,6 +3,7 @@ import { App as AntApp, ConfigProvider, theme } from "antd";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { AuthGate } from "./components/AuthGate";
 import "./styles.css";
 import "./workbench.css";
 
@@ -41,7 +42,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       }}
     >
       <AntApp>
-        <App />
+        <AuthGate><App /></AuthGate>
       </AntApp>
     </ConfigProvider>
   </React.StrictMode>

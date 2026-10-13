@@ -32,9 +32,10 @@ def test_task_result_has_stable_json_envelope(capsys):
 
     output = events[0]["data"]["output"]
     assert output == {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "status": "success",
         "answer": "最终答案",
+        "sources": [], "artifacts": [], "warnings": [],
     }
     assert len(events) == 1
     capsys.readouterr()

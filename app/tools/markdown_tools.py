@@ -46,7 +46,10 @@ def generate_markdown(
         full_input_path = str(Path(path) / filename)
     else:
         full_input_path = filename
-    full_path_str = resolve_path(full_input_path, session_dir)
+    try:
+        full_path_str = resolve_path(full_input_path, session_dir)
+    except ValueError as exc:
+        return f"生成Markdown文件失败: {exc}"
     file_path = Path(full_path_str)
 
     parent_dir = file_path.parent

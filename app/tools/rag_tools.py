@@ -32,7 +32,8 @@ from app.rag.metadata import (
     parse_filter_json,
 )
 from app.rag.pipeline import RagPipeline, format_search_audit, get_pipeline
-from app.rag.vectorstore import EmbeddingMismatchError, list_knowledge_bases as _list_kbs
+from app.rag.vectorstore import EmbeddingMismatchError
+from app.security.knowledge_bases import query_knowledge_config, visible_knowledge_bases
 
 
 def _with_audit(text: str, pipeline: RagPipeline) -> str:
@@ -61,13 +62,14 @@ def _open_pipeline_for_query(kb_name: str) -> RagPipeline:
     或用户口误),就会在 rag_data/ 下建出一个空目录,之后所有查询都返回「库是空的」,
     把「库不存在」这个真实原因掩盖掉,还留下垃圾目录。这里显式关闭创建。
     """
-    return get_pipeline(kb=kb_name or None, create=False)
+    config = query_knowledge_config(kb_name)
+    return get_pipeline(kb=kb_name or None, config=config, create=False)
 
 
 def _missing_kb_hint(kb_name: str) -> str:
     """库不存在时给出可用库清单,帮助模型自我纠正。"""
     try:
-        bases = _list_kbs(load_rag_config().data_path)
+        bases = visible_knowledge_bases()
         names = [item["name"] for item in bases if item["chunk_count"] > 0]
     except Exception:
         names = []
@@ -92,7 +94,7 @@ def list_knowledge_bases() -> str:
 
     try:
         config = load_rag_config()
-        bases = _list_kbs(config.data_path)
+        bases = visible_knowledge_bases()
         if not bases:
             return (
                 "当前没有任何知识库。请先由管理员执行入库命令:"

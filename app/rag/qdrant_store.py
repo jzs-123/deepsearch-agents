@@ -26,6 +26,7 @@ Qdrant 向量存储后端（可插拔，替代 numpy 全量点积）
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import time
 import uuid
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 # 复用 numpy 版的库级元数据文件名（保持 meta.json 语义一致）
 META_FILE = "meta.json"
 # collection 名：本地模式每个知识库一个独立 qdrant 实例，名字无所谓；远程模式共享实例，
-# 这里统一用知识库名（path.name）作为 collection 名，保证多库互不串扰。
+# 远程模式按完整知识库路径生成独立 collection，包含租户目录。
 COLLECTION_NAME = "rag_chunks"
 
 
@@ -66,6 +67,11 @@ class QdrantStore:
         self.path = Path(path)
         self.kb = self.path.name
         self.url = url or ""
+        # 远程服务共享同一地址时，每个知识库仍需独立 collection。
+        self.collection_name = (
+            f"chunks_{hashlib.sha256(str(self.path.resolve()).encode()).hexdigest()[:24]}"
+            if self.url else COLLECTION_NAME
+        )
         self.meta: dict = {}
         self.embedding_fingerprint = ""
         self.dim = 0
@@ -101,6 +107,10 @@ class QdrantStore:
                     f"当前配置为 [{embedding_fingerprint}]。向量空间不可比,"
                     f"请统一向量模型后重新入库。"
                 )
+        if url and store.meta.get("chunk_count", 0) and not store.meta.get("collection_name"):
+            raise RuntimeError("旧远程 Qdrant 库使用共享 collection，请备份后重新入库到独立 collection")
+        if url and store.meta.get("collection_name"):
+            store.collection_name = store.meta["collection_name"]
         return store
 
     def _load_meta(self) -> None:
@@ -124,6 +134,7 @@ class QdrantStore:
                 "chunk_count": len(self),
                 "data_version": int(self.data_version),
                 "vectorstore": "qdrant",
+                "collection_name": self.collection_name,
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
         )
@@ -151,25 +162,25 @@ class QdrantStore:
 
     def _ensure_collection(self, dim: int) -> None:
         client = self._get_client()
-        if client.collection_exists(COLLECTION_NAME):
+        if client.collection_exists(self.collection_name):
             return
         from qdrant_client.models import Distance, VectorParams
 
         client.create_collection(
-            collection_name=COLLECTION_NAME,
+            collection_name=self.collection_name,
             vectors_config=VectorParams(size=int(dim), distance=Distance.COSINE),
         )
 
     def _scroll_all(self, with_payload: bool = True, with_vectors: bool = False):
         """分页读回 collection 里的全部 point，返回 point 列表。"""
         client = self._get_client()
-        if not client.collection_exists(COLLECTION_NAME):
+        if not client.collection_exists(self.collection_name):
             return []
         points: list = []
         offset = None
         while True:
             page, offset = client.scroll(
-                collection_name=COLLECTION_NAME,
+                collection_name=self.collection_name,
                 limit=1000,
                 offset=offset,
                 with_vectors=with_vectors,
@@ -227,7 +238,7 @@ class QdrantStore:
         self.embedding_fingerprint = embedding_fingerprint
         self.dim = len(vectors[0])
         self._ensure_collection(self.dim)
-        self._get_client().upsert(collection_name=COLLECTION_NAME, points=points)
+        self._get_client().upsert(collection_name=self.collection_name, points=points)
         self.bump_version()
         logger.debug("知识库 %s 追加 %d 条", self.kb, len(points))
         return len(points)
@@ -237,14 +248,14 @@ class QdrantStore:
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         client = self._get_client()
-        if not client.collection_exists(COLLECTION_NAME):
+        if not client.collection_exists(self.collection_name):
             return 0
 
         ids = []
         offset = None
         while True:
             page, offset = client.scroll(
-                collection_name=COLLECTION_NAME,
+                collection_name=self.collection_name,
                 limit=1000,
                 offset=offset,
                 with_vectors=False,
@@ -259,7 +270,7 @@ class QdrantStore:
 
         if not ids:
             return 0
-        client.delete(collection_name=COLLECTION_NAME, points_selector=ids)
+        client.delete(collection_name=self.collection_name, points_selector=ids)
         self.bump_version()
         return len(ids)
 
@@ -269,8 +280,8 @@ class QdrantStore:
 
     def clear(self) -> None:
         client = self._get_client()
-        if client.collection_exists(COLLECTION_NAME):
-            client.delete_collection(COLLECTION_NAME)
+        if client.collection_exists(self.collection_name):
+            client.delete_collection(self.collection_name)
         self.embedding_fingerprint = ""
         self.dim = 0
         self.meta = {}
@@ -280,13 +291,13 @@ class QdrantStore:
 
     def search(self, query_vector, top_k: int = 10) -> list[SearchHit]:
         client = self._get_client()
-        if not client.collection_exists(COLLECTION_NAME):
+        if not client.collection_exists(self.collection_name):
             return []
         if top_k <= 0:
             return []
 
         result = client.query_points(
-            collection_name=COLLECTION_NAME,
+            collection_name=self.collection_name,
             query=list(map(float, query_vector)),
             limit=top_k,
             with_payload=True,
@@ -315,9 +326,9 @@ class QdrantStore:
 
     def __len__(self) -> int:
         client = self._get_client()
-        if not client.collection_exists(COLLECTION_NAME):
+        if not client.collection_exists(self.collection_name):
             return 0
-        return client.count(collection_name=COLLECTION_NAME).count
+        return client.count(collection_name=self.collection_name).count
 
     @property
     def size(self) -> int:

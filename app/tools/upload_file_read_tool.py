@@ -55,7 +55,10 @@ def read_file_content(
 
     # 解析路径时优先约束在当前 session_dir 内，避免模型传入绝对路径导致越界读取
     session_dir = get_session_context()
-    file_path = Path(resolve_path(filename, session_dir))
+    try:
+        file_path = Path(resolve_path(filename, session_dir))
+    except ValueError as exc:
+        return f"错误：{exc}"
 
     if not file_path.exists():
         return f"错误：文件 '{filename}' 不存在 (解析路径: {file_path})。"

@@ -152,6 +152,7 @@ class PipelineCache:
         self.fingerprint = fingerprint or ""
         self.data_version = int(data_version or 0)
         self.enabled = bool(enabled)
+        self.result_policy = ""
         self.stats = CacheStats()
         self._embeddings: JsonlCache | None = None
         self._queries: JsonlCache | None = None
@@ -206,7 +207,8 @@ class PipelineCache:
 
     # ── 查询结果 ──
     def query_cache_key(self, query: str, canonical_filter: str, top_n: int | None = None) -> str:
-        return compound_key(query, canonical_filter, str(top_n or ""), self.fingerprint, self.data_version)
+        parts = [query, canonical_filter, str(top_n or ""), self.fingerprint, self.data_version]
+        return compound_key(*parts, self.result_policy) if self.result_policy else compound_key(*parts)
 
     def get_query(self, query: str, canonical_filter: str, top_n: int | None = None) -> tuple[str, dict | None]:
         """返回 (缓存键, 载荷)。载荷必须是含 `results` 列表的字典,否则按未命中处理。"""
@@ -234,7 +236,7 @@ class PipelineCache:
     def generation_cache_key(
         self, query: str, canonical_filter: str, chunk_ids: list[str], model: str
     ) -> str:
-        return compound_key(
+        parts = (
             query,
             canonical_filter,
             ",".join(chunk_ids),
@@ -242,6 +244,7 @@ class PipelineCache:
             self.fingerprint,
             self.data_version,
         )
+        return compound_key(*parts, self.result_policy) if self.result_policy else compound_key(*parts)
 
     def get_generation(
         self, query: str, canonical_filter: str, chunk_ids: list[str], model: str

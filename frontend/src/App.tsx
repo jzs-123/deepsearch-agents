@@ -60,7 +60,11 @@ export default function App() {
         return;
       }
       setTurns((previous) => previous.map((turn, index) =>
-        index === previous.length - 1 ? { ...turn, files: session.files } : turn));
+        index === previous.length - 1 ? {
+          ...turn, files: session.files, isRunning: session.isRunning,
+          result: session.result || session.lastError || turn.result,
+          events: session.events.length ? session.events : turn.events,
+        } : turn));
       return;
     }
     setTurns((previous) => {
@@ -70,11 +74,11 @@ export default function App() {
             events: session.events,
             files: session.files,
             isRunning: session.isRunning,
-            result: session.result
+            result: session.result || (!session.isRunning ? session.lastError : "")
           }
         : turn);
     });
-  }, [session.events, session.files, session.historyMessages, session.isRunning, session.result]);
+  }, [session.events, session.files, session.historyMessages, session.isRunning, session.result, session.lastError]);
 
   useEffect(() => {
     activeTurnIdRef.current = null;

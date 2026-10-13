@@ -15,6 +15,8 @@ export interface MonitorMessage {
   message: string;
   data: Record<string, unknown>;
   timestamp: string;
+  task_id?: string;
+  seq?: number;
 }
 
 export interface RagSource {
@@ -47,6 +49,27 @@ export type SocketMessage = MonitorMessage | PongMessage;
 export interface TaskResponse {
   status: "started" | string;
   thread_id: string;
+  task_id: string;
+}
+
+export interface TaskSnapshot {
+  task_id: string;
+  thread_id: string;
+  status: "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "interrupted";
+  query: string;
+  result: string;
+  error_code: string;
+  error_message: string;
+  output?: AgentOutput | null;
+}
+
+export interface AgentOutput {
+  schema_version: "2.0";
+  status: "success" | "partial" | "refused" | "failed";
+  answer: string;
+  sources: Array<{ source_id: string; type: string; title: string; uri: string; locator: string; excerpt: string }>;
+  artifacts: Array<{ path: string; title: string }>;
+  warnings: string[];
 }
 
 export interface CancelTaskResponse {

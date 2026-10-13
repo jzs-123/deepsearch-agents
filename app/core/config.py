@@ -135,6 +135,7 @@ class Settings(BaseSettings):
     output_dir: str = str(PROJECT_ROOT / "output")
     updated_dir: str = str(PROJECT_ROOT / "updated")
     memory_db_path: str = str(PROJECT_ROOT / "app" / "data" / "memory.db")
+    sessions_db_path: str = str(PROJECT_ROOT / "app" / "sessions.db")
 
     # ─── 记忆模块 ─────────────────────────────────────────
     memory_recall_limit: int = 5
@@ -148,9 +149,14 @@ class Settings(BaseSettings):
     # ─── 安全 ─────────────────────────────────────────────
     auth_enabled: bool = False
     auth_api_key: str = ""
+    # 服务端绑定凭证与身份，不能信任客户端的 X-User-Id/X-Tenant-Id。
+    auth_users: dict[str, dict[str, str]] = {}
+    cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    rag_shared_kbs: list[str] = []
 
     # ─── 并发与限流 ───────────────────────────────────────
     max_concurrent_tasks: int = 8
+    agent_recursion_limit: int = 60
     rate_limit_per_minute: int = 60
 
     # ─── 日志 ─────────────────────────────────────────────

@@ -115,7 +115,7 @@ def test_cn_numbered_heading_still_works_when_genuine():
 def test_bare_heading_recognised_in_resume_like_text():
     """无编号裸标题(基本信息/教育经历/项目经历)必须被识别为标题。"""
     doc = _doc(
-        "基本信息\n姓名:孙子杰\n电话:187xxx\n\n"
+        "基本信息\n姓名:张三\n电话:187xxx\n\n"
         "教育经历\n山东大学 数据科学与大数据技术\n在校荣誉:校级二等奖学金。\n\n"
         "专业技能\n熟悉 Python、Docker 等工具,熟练使用各类 AI 开发工具。"
     )

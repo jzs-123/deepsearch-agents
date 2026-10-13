@@ -14,6 +14,8 @@ from typing import Any, Optional
 from fastapi import WebSocket
 
 from app.api.context import get_thread_context
+from app.api.task_store import append_event, current_task_id
+from app.agent.result import AgentResult
 
 
 _event_collector: ContextVar[Optional[list[dict[str, Any]]]] = ContextVar(
@@ -54,6 +56,7 @@ class ToolMonitor:
         event_type: str,
         message: str,
         data: Optional[dict[str, Any]] = None,
+        thread_id: Optional[str] = None,
     ) -> None:
         """
         构造统一监控事件，并尝试推送到当前 thread_id 对应的前端连接
@@ -70,16 +73,20 @@ class ToolMonitor:
             "timestamp": datetime.datetime.now().isoformat(),
         }
 
+        task_id = current_task_id.get()
+        if task_id:
+            payload = append_event(task_id, payload)
+
         collector = _event_collector.get()
         if collector is not None:
             collector.append(payload)
 
         if self.websocket_manager:
             try:
-                thread_id = get_thread_context()
+                thread_id = thread_id or get_thread_context()
                 manager_loop = self.websocket_manager.loop
 
-                if manager_loop and thread_id:
+                if manager_loop and not manager_loop.is_closed() and thread_id:
                     self._send_to_websocket(payload, thread_id, manager_loop)
             except Exception as e:
                 print(f"[Monitor] WebSocket send failed: {e}")
@@ -141,18 +148,15 @@ class ToolMonitor:
             {"assistant_name": assistant_name, "args": args},
         )
 
-    def report_task_result(self, result: str) -> None:
+    def report_task_result(self, result: AgentResult | str) -> None:
         """报告任务最终结果"""
+        output = result if isinstance(result, AgentResult) else AgentResult(status="success", answer=result)
         self._emit(
             "task_result",
             "任务执行完成",
             {
-                "result": result,
-                "output": {
-                    "schema_version": "1.0",
-                    "status": "success",
-                    "answer": result,
-                },
+                "result": output.answer,
+                "output": output.model_dump(),
             },
         )
 
@@ -161,9 +165,9 @@ class ToolMonitor:
         count = len(payload.get("sources") or [])
         self._emit("rag_sources", f"检索到 {count} 条知识库依据", payload)
 
-    def report_task_cancelled(self) -> None:
+    def report_task_cancelled(self, thread_id: Optional[str] = None) -> None:
         """报告任务已被用户取消"""
-        self._emit("task_cancelled", "任务已取消")
+        self._emit("task_cancelled", "任务已取消", thread_id=thread_id)
 
     def report_session_dir(self, path: str) -> None:
         """报告当前任务工作目录"""
@@ -181,7 +185,7 @@ class ConnectionManager:
     """
 
     def __init__(self) -> None:
-        self.active_connections: dict[str, WebSocket] = {}
+        self.active_connections: dict[str, set[WebSocket]] = {}
         # WebSocket 发送必须回到创建连接的事件循环，因此启动时需要显式绑定 loop
         self.loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -194,13 +198,16 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket, thread_id: str) -> None:
         """接受 WebSocket 连接，并按 thread_id 保存"""
         await websocket.accept()
-        self.active_connections[thread_id] = websocket
+        self.active_connections.setdefault(thread_id, set()).add(websocket)
         print(f"Client connected: {thread_id}")
 
     def disconnect(self, websocket: WebSocket, thread_id: str) -> None:
         """移除已经断开的 WebSocket 连接"""
-        if self.active_connections.get(thread_id) is websocket:
-            del self.active_connections[thread_id]
+        connections = self.active_connections.get(thread_id, set())
+        if websocket in connections:
+            connections.remove(websocket)
+            if not connections:
+                self.active_connections.pop(thread_id, None)
             print(f"Client disconnected: {thread_id}")
         else:
             print(f"Stale websocket disconnected, current connection kept: {thread_id}")
@@ -211,9 +218,11 @@ class ConnectionManager:
 
     async def send_to_thread(self, message: dict[str, Any], thread_id: str) -> None:
         """向指定 thread_id 对应的前端连接发送 JSON 消息"""
-        if thread_id in self.active_connections:
-            websocket = self.active_connections[thread_id]
-            await websocket.send_json(message)
+        for websocket in tuple(self.active_connections.get(thread_id, set())):
+            try:
+                await websocket.send_json(message)
+            except Exception:
+                self.disconnect(websocket, thread_id)
 
 
 manager = ConnectionManager()

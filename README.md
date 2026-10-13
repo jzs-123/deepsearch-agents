@@ -29,8 +29,9 @@ DeepSearch Agents 将公开网页、业务数据库、内部知识库与上传�
 | 依据与溯源 | RAG 返回来源、标题和原文片段；低分问题直接拒答，前端可查看检索证据 |
 | 报告交付 | 支持生成 Markdown、转换 PDF，以及文件列表和下载 |
 | 会话与记忆 | 会话历史和长期记忆分别持久化，上下文按预算组织 |
-| 执行过程 | 通过 WebSocket 展示工具调用、子 Agent 调用、结果与异常，支持任务取消 |
-| 基础治理 | 提供 API Key 鉴权配置、SQL 查询规则、并发限制和会话上下文管理 |
+| 执行过程 | 任务状态与事件持久化，支持取消、刷新恢复、WebSocket 断线补发 |
+| 结果契约 | 主 Agent 通过 Pydantic Schema 提交答案、来源与产物，格式纠错最多两次 |
+| 基础治理 | API Key 映射用户与租户，校验资源归属，隔离会话文件和租户知识库 |
 | 评测与观测 | 提供检索评测、Ragas 适配、审计日志、健康检查及基础运行指标 |
 
 ## 系统架构
@@ -50,7 +51,7 @@ React 研究工作台
                          │
                 汇总回答 / Markdown / PDF
 
-持久化：SQLite（会话与记忆）
+持久化：SQLite（会话、任务、事件与记忆）
 知识索引：NumPy 或 Qdrant + BM25 + 文档与版本元数据
 ```
 
@@ -224,9 +225,10 @@ docker compose --env-file .env -f docker/docker-compose.yaml up -d
 | `RAG_VECTORSTORE` / `RAG_QDRANT_URL` | 向量存储后端 |
 | `CONTEXT_MAX_TOKENS` | 上下文预算 |
 | `MAX_CONCURRENT_TASKS` | 进程内并发任务上限 |
-| `AUTH_ENABLED` / `AUTH_API_KEY` | 配置 API Key 鉴权入口 |
+| `AUTH_ENABLED` / `AUTH_USERS` | 开启鉴权，将凭证映射到用户与租户 |
+| `RAG_SHARED_KBS` | 显式声明允许读取的公共知识库 |
 
-默认是本地匿名模式。当前 API Key 配置不等于完整的多用户资源授权；多人部署前需补齐会话归属、文件访问与知识库作用域检查，并使用 HTTPS。配置、记忆与上下文设计见 [工程设计文档](docs/enterprise-upgrade-design.md)。
+默认是本地匿名模式。多人部署时配置 `AUTH_USERS` 并使用 HTTPS；旧 `AUTH_API_KEY` 仅映射到固定匿名身份。会话、任务、文件、WebSocket 和知识库都校验身份与作用域，详见 [权限与隔离](docs/agent-security.md)。当前任务运行限于单 Worker，重启后标为中断，详见 [任务恢复](docs/task-recovery.md)。
 
 ## API 概览
 
@@ -234,6 +236,9 @@ docker compose --env-file .env -f docker/docker-compose.yaml up -d
 | --- | --- |
 | `POST /api/task` | 提交研究任务 |
 | `POST /api/task/{thread_id}/cancel` | 请求取消会话任务 |
+| `GET /api/tasks/{task_id}` / `GET /api/tasks/{task_id}/events` | 任务快照与按序号补发事件 |
+| `GET /api/sessions/{thread_id}/task` | 获取会话最近一次任务 |
+| `POST /api/auth/login` / `POST /api/auth/logout` | 前端凭证登录与退出 |
 | `GET /api/sessions` / `GET /api/sessions/{thread_id}` | 会话列表与历史 |
 | `POST /api/upload` | 上传会话附件 |
 | `GET /api/knowledge-bases` | 查看可访问知识库 |
@@ -252,10 +257,13 @@ uv sync --extra local-embedding --extra test
 uv run --no-sync pytest
 
 # 前端生产构建（在 frontend 目录）
+pnpm test
 pnpm build
 ```
 
 RAG 评测分为检索质量、生成质量与负例拒答。评测集应与目标语料匹配；Ragas 需要额外安装 `ragas`、`datasets` 并配置评测模型。离线近似检查与 Ragas 指标分别报告。
+
+需要应用知识库级拒答阈值时，运行 `python -m app.rag.cli eval -k <知识库> -e <正负评测集> -n <RAG_TOP_N> --save-calibration`。标定保存在该库的 `calibration.json`，记录向量指纹、数据版本、检索配置和评测集摘要；匹配时用于检索问答，失效时提示重新标定。请用独立验证集评估，标定集上的分数不代表泛化质量。
 
 - [RAG 评测指南](docs/rag-eval-guide.md)
 - [检索与集成测试说明](docs/rag-testing-guide.md)

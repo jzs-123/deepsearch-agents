@@ -68,7 +68,7 @@ class ContextManager:
 
         # 2) 情节记忆(会话历史)重放
         history_msgs: list[dict[str, str]] = []
-        for m in get_session_messages(session_id):
+        for m in get_session_messages(session_id, identity.user_id, identity.tenant_id):
             role = m.get("role")
             content = (m.get("content") or "").strip()
             if role in ("user", "assistant") and content:

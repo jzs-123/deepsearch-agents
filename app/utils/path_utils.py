@@ -29,14 +29,8 @@ def resolve_path(filename: str, session_dir: Optional[str] = None) -> str:
             path_str = str(path).replace("\\", "/")
             break
 
-    # updated/ 用于存放用户上传文件，应优先按项目根目录下的真实上传路径解析
-    if "updated/" in path_str:
-        idx = path_str.find("updated/")
-        relative_part = path_str[idx:]
-        return str(Path(relative_part).resolve())
-
     if not session_dir:
-        return str(path.resolve())
+        raise ValueError("文件访问缺少会话上下文")
 
     session_path = Path(session_dir).resolve()
     session_name = session_path.name
@@ -55,19 +49,22 @@ def resolve_path(filename: str, session_dir: Optional[str] = None) -> str:
         except Exception:
             pass
 
-        # 真实绝对路径且不在 session_dir 中时保持原样，避免误改外部资源路径
-        return str(full_path)
+        raise ValueError("文件路径超出当前会话目录")
 
     parts = path.parts
 
     # 避免模型把 session 名或 output 前缀重复拼到当前会话目录里
-    if session_name in parts:
-        return str(session_path / path.name)
-
     if parts and parts[0] == "output":
-        return str(session_path / path.name)
+        if len(parts) < 3 or parts[1] != session_name:
+            raise ValueError("文件路径超出当前会话目录")
+        path = Path(*parts[2:])
+    elif parts and parts[0] == session_name:
+        path = Path(*parts[1:])
 
-    return str(session_path / path)
+    full_path = (session_path / path).resolve()
+    if not full_path.is_relative_to(session_path):
+        raise ValueError("文件路径超出当前会话目录")
+    return str(full_path)
 
 
 def _fix_nested_session_path(

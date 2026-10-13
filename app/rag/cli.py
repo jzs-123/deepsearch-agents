@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 # 支持 `python app/rag/cli.py ...` 直接运行:把项目根目录加进 sys.path
@@ -28,6 +29,7 @@ if __package__ in (None, ""):  # pragma: no cover
 
 from app.rag.audit import format_audit_records, read_audit  # noqa: E402
 from app.rag.config import load_rag_config  # noqa: E402
+from app.rag.calibration import CalibrationRequiredError, save_calibration  # noqa: E402
 from app.rag.eval import evaluate, format_report, load_eval_set  # noqa: E402
 from app.rag.metadata import (  # noqa: E402
     InvalidFilterError,
@@ -35,7 +37,7 @@ from app.rag.metadata import (  # noqa: E402
     normalize_filter,
     parse_filter_json,
 )
-from app.rag.pipeline import format_search_audit, get_pipeline  # noqa: E402
+from app.rag.pipeline import RagPipeline, format_search_audit, get_pipeline  # noqa: E402
 from app.rag.vectorstore import EmbeddingMismatchError, list_knowledge_bases  # noqa: E402
 
 
@@ -170,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-rerank", action="store_true", help="关闭重排(用于对比重排带来的收益)"
     )
     p_eval.add_argument("--json", action="store_true")
+    p_eval.add_argument("--save-calibration", action="store_true", help="保存本知识库的拒答阈值标定；模型、数据或检索配置变化后需重做")
 
     p_stats = sub.add_parser("stats", help="查看知识库规模与配置")
     add_common(p_stats)
@@ -362,9 +365,9 @@ def cmd_search(args) -> int:
         return 0
     # 阈值提示:search 只做检索、不做拒答,但要让使用者知道「这些片段够不够作为依据」
     gate = pipeline.grounded_score(results)
-    if results and gate < config.min_score:
+    if results and gate < pipeline.config.min_score:
         print(
-            f"提示:向量余弦 {gate:.4f} 低于拒答阈值 {config.min_score},"
+            f"提示:向量余弦 {gate:.4f} 低于拒答阈值 {pipeline.config.min_score},"
             f"ask 会判定为「知识库无依据」并拒答;以下片段仅供排查参考。"
         )
     for item in results:
@@ -414,7 +417,15 @@ def cmd_ask(args) -> int:
 
 def cmd_eval(args) -> int:
     config = _build_config(args)
-    pipeline = get_pipeline(kb=args.kb, config=config)
+    if getattr(args, "save_calibration", False):
+        # 重做标定时允许绕过旧标定，不能让失效记录阻止恢复。
+        config = replace(config, use_calibration=False)
+        if args.k != config.top_n:
+            raise ValueError("保存标定时 -n 必须与运行时 RAG_TOP_N 相同")
+        if getattr(args, "rewrite_always", False):
+            raise ValueError("保存标定时请用 --rewrite 配置运行时策略，不使用 --rewrite-always")
+    # 标定必须读取磁盘上的最新数据版本，避免复用此前评测的索引快照。
+    pipeline = RagPipeline(kb=args.kb, config=config)
     items = load_eval_set(args.eval_set)
     result = evaluate(
         pipeline,
@@ -423,6 +434,10 @@ def cmd_eval(args) -> int:
         rewrite=True if getattr(args, "rewrite_always", False) else None,
         filter=_parse_filter(args),
     )
+    if getattr(args, "save_calibration", False):
+        if _parse_filter(args):
+            raise ValueError("知识库级标定不支持限定元数据过滤范围")
+        save_calibration(pipeline, result, args.eval_set)
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     else:
@@ -501,6 +516,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except InvalidFilterError as exc:
         print(f"过滤条件错误:{exc}", file=sys.stderr)
+        return 2
+    except CalibrationRequiredError as exc:
+        print(f"标定错误:{exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"参数错误:{exc}", file=sys.stderr)
         return 2
     except FileNotFoundError as exc:
         print(f"文件错误:{exc}", file=sys.stderr)

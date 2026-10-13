@@ -54,6 +54,8 @@ def _ensure_root() -> Path:
 os.environ.setdefault("RAG_DATA_DIR", str(_ensure_root() / "_isolated_rag_data"))
 # 默认就别去碰 sentence-transformers：tool 层会走 load_rag_config()
 os.environ.setdefault("RAG_EMBEDDING_PROVIDER", "hash")
+os.environ.setdefault("SESSIONS_DB_PATH", str(_ensure_root() / "_isolated_sessions.db"))
+os.environ.setdefault("MEMORY_DB_PATH", str(_ensure_root() / "_isolated_memory.db"))
 
 
 # ── 3. 夹具 ──────────────────────────────────────────────────────────
