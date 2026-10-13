@@ -105,6 +105,14 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--no-cache", dest="cache_enabled", action="store_false",
                        help="本次查询关闭结果缓存")
 
+    def add_min_score_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--min-score",
+            type=float,
+            default=None,
+            help="临时覆盖拒答阈值，便于按评测建议复验",
+        )
+
     p_list = sub.add_parser("list", help="列出所有知识库")
     p_list.add_argument("--json", action="store_true", help="以 JSON 输出")
 
@@ -131,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_rewrite_args(p_search, with_always=True)
     add_filter_args(p_search)
     add_cache_args(p_search)
+    add_min_score_arg(p_search)
     p_search.add_argument("-q", "--question", required=True)
     p_search.add_argument("-n", "--top-n", type=int, default=None, help="返回条数")
     p_search.add_argument("--top-k", type=int, default=None, help="粗排候选数")
@@ -144,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_rewrite_args(p_ask)
     add_filter_args(p_ask)
     add_cache_args(p_ask)
+    add_min_score_arg(p_ask)
     p_ask.add_argument("-q", "--question", required=True)
     p_ask.add_argument("-n", "--top-n", type=int, default=None)
     p_ask.add_argument("--json", action="store_true")
@@ -153,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_rewrite_args(p_eval, with_always=True)
     add_filter_args(p_eval)
     add_cache_args(p_eval)
+    add_min_score_arg(p_eval)
     p_eval.add_argument("-e", "--eval-set", required=True, help="评测集 JSON/JSONL 路径")
     p_eval.add_argument("-n", "--k", type=int, default=5, help="评测的 top-k,默认 5")
     p_eval.add_argument(
@@ -191,6 +202,8 @@ def _build_config(args) -> object:
         overrides["top_n"] = args.top_n
     if getattr(args, "top_k", None):
         overrides["top_k"] = args.top_k
+    if getattr(args, "min_score", None) is not None:
+        overrides["min_score"] = args.min_score
     if getattr(args, "no_rerank", False):
         overrides["rerank_mode"] = "off"
     # 查询改写开关(只有 search/ask/eval 传了这些参数)

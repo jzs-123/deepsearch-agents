@@ -17,6 +17,26 @@ export interface MonitorMessage {
   timestamp: string;
 }
 
+export interface RagSource {
+  rank: number;
+  source: string;
+  source_path: string;
+  chunk_index: number;
+  heading: string;
+  score: number;
+  dense_score: number | null;
+  text: string;
+}
+
+export interface RagSourceTrace {
+  kb: string;
+  question: string;
+  grounded: boolean;
+  gate_score: number;
+  threshold: number;
+  sources: RagSource[];
+}
+
 export interface PongMessage {
   type: "pong";
   message: string;
@@ -38,6 +58,39 @@ export interface CancelTaskResponse {
 export interface UploadResponse {
   status: "uploaded" | string;
   files: string[];
+}
+
+export interface KnowledgeBaseSummary {
+  name: string;
+  chunk_count: number;
+  embedding: string;
+  updated_at: string;
+  data_version: number;
+  filter_fields: string[];
+  backend: string;
+  recommendation: string;
+}
+
+export interface KnowledgeBaseListResponse {
+  default_kb: string;
+  knowledge_bases: KnowledgeBaseSummary[];
+}
+
+export interface IngestReport {
+  kb: string;
+  files_total: number;
+  files_indexed: number;
+  files_skipped: number;
+  chunks_added: number;
+  chunks_replaced: number;
+  total_chunks: number;
+  elapsed: number;
+  warnings: string[];
+}
+
+export interface KnowledgeBaseIngestResponse {
+  status: "indexed" | string;
+  report: IngestReport;
 }
 
 export interface OutputFile {

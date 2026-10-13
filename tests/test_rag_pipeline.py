@@ -116,6 +116,35 @@ def test_add_texts_offsets_indices_across_inputs(pipeline):
     assert len(indices) == len(set(indices)), "多个输入的 chunk_index 不能撞车"
 
 
+def test_ingest_embeds_heading_prefixed_text(rag_config):
+    """向量编码输入 = heading 前置 + 正文(与 BM25「标题参与索引」对齐)。
+
+    防止有人改回只编码 chunk.text:那样 heading 又退化为纯展示字段,
+    「XX的项目经历」这类命中标题词的 query 在向量路上拿不到任何增益。
+    """
+    from app.rag.pipeline import RagPipeline
+
+    class RecordingEmbedder(HashEmbedder):
+        def __init__(self):
+            super().__init__(dim=512)
+            self.doc_inputs: list[str] = []
+
+        def encode(self, texts, is_query=False, **kwargs):
+            if not is_query:
+                self.doc_inputs.extend(texts)
+            return super().encode(texts, is_query=is_query, **kwargs)
+
+    embedder = RecordingEmbedder()
+    pipeline = RagPipeline(kb="headingtest", config=rag_config, embedder=embedder)
+    pipeline.add_texts(["# 风控总章\n\n准确率为 91.5%。"], source="doc.md")
+    assert embedder.doc_inputs, "入库必须调用向量编码"
+    assert all(text.startswith("风控总章") for text in embedder.doc_inputs)
+    # 持久化的 chunk.text 保持原文,不带 heading 前缀(展示/引用仍是干净正文)
+    assert all(
+        not chunk.text.startswith("风控总章\n") for chunk in pipeline.store.all_chunks()
+    )
+
+
 # ── search ──────────────────────────────────────────────────────────
 
 

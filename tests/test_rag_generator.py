@@ -203,3 +203,98 @@ def test_normal_answer_without_marker_is_grounded(make_chunk, stub_client):
         "q", [_hit(make_chunk)], gate_score=0.9
     )
     assert answer.grounded is True
+
+
+# ── 推理模型思维链耗尽 max_tokens（截断重试）───────────────────────────
+
+
+class _FakeMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content: str, finish_reason: str):
+        self.message = _FakeMessage(content)
+        self.finish_reason = finish_reason
+
+
+class _FakeResponse:
+    def __init__(self, choices):
+        self.choices = choices
+
+
+class _FakeCompletions:
+    """按调用顺序回放预设响应,并记录每次请求的 max_tokens 与 extra_body。"""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.requested_max_tokens: list[int] = []
+        self.requested_extra_body: list = []
+
+    def create(self, **kwargs):
+        self.requested_max_tokens.append(kwargs["max_tokens"])
+        self.requested_extra_body.append(kwargs.get("extra_body"))
+        return self._responses.pop(0)
+
+
+class _FakeOpenAI:
+    def __init__(self, responses):
+        self.chat = type("_Chat", (), {})()
+        self.chat.completions = _FakeCompletions(responses)
+
+
+def test_reasoning_exhausts_tokens_retries_with_larger_budget():
+    """★ 推理模型(deepseek-v4-pro)思维链吃光 max_tokens:content 为空 + finish_reason=length
+    时必须放大预算重试,而不是把空文本交回上游被误判成「模型拒答」。"""
+    from app.rag.generator import ChatClient
+
+    client = ChatClient(model="deepseek-v4-pro", api_key="sk-test", base_url="http://localhost")
+    client._client = _FakeOpenAI([
+        _FakeResponse([_FakeChoice("", "length")]),          # 第一次:思考耗尽,正文为空
+        _FakeResponse([_FakeChoice("孙子杰的项目是深度研搜平台[1]。", "stop")]),  # 重试成功
+    ])
+    text = client.complete("system", "user", max_tokens=1200)
+    assert text == "孙子杰的项目是深度研搜平台[1]。"
+    assert client._client.chat.completions.requested_max_tokens == [1200, 4800]
+
+
+def test_reasoning_retry_not_triggered_when_finish_reason_is_stop():
+    """正常截断以外的空回复(如服务端异常返回空)不重试,保持原有行为。"""
+    from app.rag.generator import ChatClient
+
+    client = ChatClient(model="m", api_key="sk-test", base_url="")
+    client._client = _FakeOpenAI([
+        _FakeResponse([_FakeChoice("", "stop")]),
+    ])
+    assert client.complete("s", "u", max_tokens=1200) == ""
+    assert client._client.chat.completions.requested_max_tokens == [1200]
+
+
+# ── 思维链开关(thinking 参数注入)─────────────────────────────────────
+
+
+def test_thinking_disabled_is_passed_via_extra_body():
+    """★ 关闭思考:disabled 必须经 extra_body 注入到每一次请求(含重试)。"""
+    from app.rag.generator import ChatClient
+
+    client = ChatClient(model="deepseek-v4-pro", api_key="sk-test", base_url="", thinking="disabled")
+    client._client = _FakeOpenAI([
+        _FakeResponse([_FakeChoice("", "length")]),               # 首发被截断
+        _FakeResponse([_FakeChoice("正文[1]。", "stop")]),          # 重试成功
+    ])
+    assert client.complete("s", "u", max_tokens=1200) == "正文[1]。"
+    extras = client._client.chat.completions.requested_extra_body
+    assert extras == [{"thinking": {"type": "disabled"}}] * 2
+
+
+def test_thinking_empty_omits_extra_body():
+    """空串 = 不干预,跟随服务端默认,不应注入任何额外参数。"""
+    from app.rag.generator import ChatClient
+
+    client = ChatClient(model="m", api_key="sk-test", base_url="", thinking="")
+    client._client = _FakeOpenAI([
+        _FakeResponse([_FakeChoice("正文[1]。", "stop")]),
+    ])
+    assert client.complete("s", "u") == "正文[1]。"
+    assert client._client.chat.completions.requested_extra_body == [{}]

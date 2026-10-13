@@ -105,6 +105,42 @@ def read_text_file(path: Path) -> str:
 _MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 
 
+# ────────────────────────────── PDF 文本层质量检测 ──────────────────────────────
+
+# 「正常中文/英文业务文档」的主体字符集:ASCII 可见字符、CJK 统一表意、
+# 中文标点、全角形式。文本层字符落在这些范围之外的占比过高,说明该页字体
+# 缺少 ToUnicode 映射(简历制作工具/设计类导出器的通病),pypdf 只能把原始
+# CID 直接解成藏文/缅甸文/拉丁扩展区一类的乱码 —— 这种页**字符数并不少**,
+# 「文本层过少 → OCR」的既有兜底完全覆盖不到,必须按质量单独判定。
+_EXPECTED_CHAR_RANGES = (
+    (0x09, 0x0A),     # \t \n
+    (0x20, 0x7E),      # ASCII 可见字符
+    (0x4E00, 0x9FFF),  # CJK 统一表意
+    (0x3000, 0x303F),  # 中文标点(。「」等)
+    (0xFF00, 0xFFEF),  # 全角形式(，！％等)
+)
+
+#: 异常字符占比超过该值即判定该页文本层不可信,强制改走 OCR。
+MOJIBAKE_MAX_RATIO = 0.15
+
+
+def mojibake_ratio(text: str) -> float:
+    """统计文本中「预期字符集之外」字符的占比(0.0~1.0)。空串返回 0.0。
+
+    用白名单而不是黑名单的原因:乱码会散落在任意 Unicode 区块(藏文、缅甸文、
+    拉丁扩展、私有区……),黑名单永远枚不全;而正常中文语料的主体字符集是
+    封闭且明确的。`·`(U+00B7)、希腊字母这类少量合法字符不会把占比推过 15%。
+    """
+    if not text:
+        return 0.0
+    unexpected = sum(
+        1
+        for ch in text
+        if not any(lo <= ord(ch) <= hi for lo, hi in _EXPECTED_CHAR_RANGES)
+    )
+    return unexpected / len(text)
+
+
 def extract_markdown_headings(text: str) -> list[tuple[int, str]]:
     """抽取 Markdown 标题及其在文本中的偏移量。"""
     return [(m.start(), m.group(2)) for m in _MD_HEADING_RE.finditer(text)]
@@ -213,18 +249,32 @@ def load_pdf(
             warnings.append(f"第 {page_no} 页解析失败:{exc}")
 
         used_ocr = False
-        if ocr_ready and len(page_text) < opts.min_text_chars:
+        # 文本层「有字但是乱码」:字符数够、按长度不会触发 OCR,但字体缺
+        # ToUnicode 映射,pypdf 解出来的是原始 CID 乱码(藏文/缅甸文/拉丁扩展区)。
+        # 按质量强制该页走 OCR,与「文本层过少」的长度规则互为补充。
+        bad_ratio = mojibake_ratio(page_text)
+        suspect = bad_ratio > MOJIBAKE_MAX_RATIO
+        if suspect:
+            warnings.append(
+                f"第 {page_no} 页文本层疑似乱码(异常字符占比 {bad_ratio:.0%})"
+            )
+        if ocr_ready and (suspect or len(page_text) < opts.min_text_chars):
             ocr_text = _ocr_pdf_page(pdf_bytes, page_no, engine, page_renderer, warnings)
             if ocr_text:
-                # 文本层本来就少 → OCR 给得更多就以它为主;两者都有就都留:
-                # 宁可多留一点(切块与去重会处理),也不要因为「择一」而丢字。
-                if not page_text:
+                if suspect:
+                    # 乱码文本层必须整体丢弃,不能与 OCR 结果拼接:
+                    # 拼进去等于主动向索引注入噪声(垃圾片段会通过 dense 通道
+                    # 越过拒答阈值,把乱码送进大模型)。
+                    page_text = ocr_text
+                elif not page_text:
                     page_text = ocr_text
                 elif len(ocr_text) > len(page_text):
                     page_text = ocr_text + "\n" + page_text
                 else:
                     page_text = page_text + "\n" + ocr_text
                 used_ocr = True
+            elif suspect:
+                warnings.append(f"第 {page_no} 页 OCR 未取回内容,乱码文本将按原样入库")
 
         if not page_text:
             empty_pages.append(page_no)
@@ -526,6 +576,7 @@ __all__ = [
     "load_document",
     "iter_supported_files",
     "normalize_text",
+    "mojibake_ratio",
     "read_text_file",
     "load_image",
     "load_pdf",

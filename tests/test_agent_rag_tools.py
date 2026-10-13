@@ -122,6 +122,25 @@ def test_search_returns_fragments_with_source_and_score(pipeline):
     assert "来源:" in out
 
 
+def test_search_emits_structured_sources_for_frontend(pipeline):
+    from app.api.monitor import monitor
+
+    pipeline.add_texts([KB_DOC], source="doc.md")
+    events = []
+    token = monitor.bind_event_collector(events)
+    try:
+        rag_tools.search_knowledge_base.invoke(
+            {"question": RELEVANT_Q, "kb_name": "test", "top_n": 2}
+        )
+    finally:
+        monitor.reset_event_collector(token)
+
+    source_event = next(event for event in events if event["event"] == "rag_sources")
+    assert source_event["data"]["kb"] == "test"
+    assert source_event["data"]["sources"][0]["source"] == "doc.md"
+    assert source_event["data"]["sources"][0]["text"]
+
+
 def test_search_on_existing_but_empty_kb(pipeline):
     from app.rag.pipeline import get_pipeline
 

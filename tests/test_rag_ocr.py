@@ -276,6 +276,94 @@ def test_ocr_disabled_on_scanned_pdf_yields_text_layer_none():
     assert doc.warnings
 
 
+# ────────────────────────── 乱码文本层(有字但是垃圾) ──────────────────────────
+
+
+def test_mojibake_ratio_normal_chinese_text_is_low():
+    """正常中英文混排的异常字符占比必须远低于阈值。"""
+    from app.rag.loaders import MOJIBAKE_MAX_RATIO, mojibake_ratio
+
+    normal = "风控模型的准确率为 91.5%,2026年第一季度授信额度复核。"
+    assert mojibake_ratio(normal) < MOJIBAKE_MAX_RATIO
+
+
+def test_mojibake_ratio_detects_cid_garbage():
+    """缺 ToUnicode 映射的 PDF 解出来的 CID 乱码占比必须显著超标。
+
+    样本取自真实故障(简历制作工具导出的 PDF):藏文/缅甸文/拉丁扩展区字符,
+    以及 `Ġ`(U+0120,即空格 0x20 被 glyph-id 平移 +0x100)这类典型签名。
+    """
+    from app.rag.loaders import MOJIBAKE_MAX_RATIO, mojibake_ratio
+
+    garbled = "ĹЧྐ༏\nྠ଀ğࢭԛളᄅğ2004.08.08\nཛདğ2836930636@qq.comğ්ྷᇜ" * 5
+    assert mojibake_ratio(garbled) > MOJIBAKE_MAX_RATIO
+
+
+def test_mojibake_text_layer_is_replaced_by_ocr(monkeypatch):
+    """乱码文本层必须被 OCR 结果**整体替换**,而不是拼接进索引。
+
+    长度规则覆盖不到这种情况:乱码页字符数远超 min_text_chars,只有
+    质量检测能兜住。拼接乱码等于向索引注入噪声 —— 垃圾片段会通过
+    dense 通道越过拒答阈值,把乱码送进大模型。
+    """
+
+    def _import_pypdf():
+        try:
+            import pypdf
+        except ImportError:
+            from app.rag.vendor import ensure_vendor_path
+
+            ensure_vendor_path()
+            import pypdf
+        return pypdf
+
+    garbled = "ĹЧྐ༏ tbugbུ \nྠ଀ğࢭԛളᄅğ2004.08.08" * 10  # 远超 MIN_CHARS
+    monkeypatch.setattr(_import_pypdf().PageObject, "extract_text", lambda self: garbled)
+
+    class _OkRenderer:
+        name = "stub-renderer"
+
+        @property
+        def available(self) -> bool:
+            return True
+
+        def render_page(self, pdf_bytes: bytes, page_index: int, *, scale: float = 2.0) -> bytes:
+            return b"\x89PNG fake"
+
+    spy = _StubEngine(text="OCR 识别出的正常中文")
+    doc = load_document(
+        TEXT_PDF,
+        ocr=OcrOptions(enabled=True, backend="windows", min_text_chars=MIN_CHARS),
+        ocr_engine=spy,
+        renderer=_OkRenderer(),
+    )
+    assert spy.calls == 1, "乱码文本层(字符数充足)没有触发 OCR"
+    assert garbled[:20] not in doc.text, "乱码没有被整体替换,仍残留在正文里"
+    assert "OCR识别出的正常中文" in doc.text.replace(" ", "")
+    assert doc.extraction == "ocr"
+    assert any("乱码" in w for w in doc.warnings)
+
+
+def test_mojibake_text_layer_kept_with_warning_when_ocr_unavailable(monkeypatch):
+    """OCR 不可用时:乱码文本按原样保留 + 明确 warning,不静默、不抛异常。"""
+    garbled = "ĹЧྐ༏ tbbugུ \nྠ଀ğࢭԛളᄅğ2004.08.08" * 10
+    try:
+        import pypdf
+    except ImportError:
+        from app.rag.vendor import ensure_vendor_path
+
+        ensure_vendor_path()
+        import pypdf
+
+    monkeypatch.setattr(pypdf.PageObject, "extract_text", lambda self: garbled)
+    doc = load_document(
+        TEXT_PDF,
+        ocr=OcrOptions(enabled=True, backend="none", min_text_chars=MIN_CHARS),
+    )
+    assert garbled[:20] in doc.text  # 没有可用 OCR,原文保留
+    assert any("乱码" in w for w in doc.warnings)
+
+
 # ────────────────────────── 扫描件 PDF ──────────────────────────
 
 

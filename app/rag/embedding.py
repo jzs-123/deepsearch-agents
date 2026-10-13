@@ -198,9 +198,22 @@ class LocalEmbedder(Embedder):
 
         device = self._resolve_device()
         logger.info("加载本地向量模型 %s (device=%s)", self.model_name, device)
-        self._model = SentenceTransformer(self.model_name, device=device)
+        try:
+            # 先只查本机缓存，避免每次启动都向 Hugging Face 发送 HEAD 请求。
+            self._model = SentenceTransformer(
+                self.model_name,
+                device=device,
+                local_files_only=True,
+            )
+        except Exception:
+            # 首次使用且本机没有模型时才联网下载；下载完成后后续启动走上面的本地路径。
+            logger.info("本机未缓存向量模型，首次从 Hugging Face 获取 %s", self.model_name)
+            self._model = SentenceTransformer(self.model_name, device=device)
         # 以模型实际输出维度为准,不硬编码 512/768,避免换模型后维度写死出错
-        self.dim = int(self._model.get_sentence_embedding_dimension())
+        get_dimension = getattr(self._model, "get_embedding_dimension", None)
+        if get_dimension is None:  # 兼容旧版 sentence-transformers
+            get_dimension = self._model.get_sentence_embedding_dimension
+        self.dim = int(get_dimension())
         logger.info("本地向量模型加载完成,dim=%d", self.dim)
         return self._model
 

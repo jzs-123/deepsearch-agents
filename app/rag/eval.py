@@ -58,6 +58,7 @@ class EvalResult:
     # 查询改写的可观测统计(默认采集,便于回答"改写到底起没起作用")
     rewrite_mode: str = "off"
     rewrite_stats: dict = field(default_factory=dict)
+    threshold_calibration: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -69,6 +70,7 @@ class EvalResult:
             "config": self.config,
             "rewrite_mode": self.rewrite_mode,
             "rewrite_stats": self.rewrite_stats,
+            "threshold_calibration": self.threshold_calibration,
             "per_query": self.per_query,
         }
 
@@ -128,6 +130,7 @@ def evaluate(
         "top_k": pipeline.config.top_k,
         "rerank_mode": pipeline.config.rerank_mode,
         "rrf_k": pipeline.config.rrf_k,
+        "sparse_enabled": pipeline.config.sparse_enabled,
         "query_rewrite": pipeline.config.query_rewrite,
         "query_variants": pipeline.config.query_variants,
         "retry_on_low_score": pipeline.config.retry_on_low_score,
@@ -249,7 +252,56 @@ def evaluate(
         result.refusal_accuracy = refusal_correct / refusal_total
     result.rewrite_mode = rewrite_stats["mode"]
     result.rewrite_stats = rewrite_stats
+    result.threshold_calibration = recommend_refusal_threshold(
+        result.per_query, pipeline.config.min_score
+    )
     return result
+
+
+def recommend_refusal_threshold(per_query: list[dict], current_threshold: float) -> dict:
+    """用正负样例的实际向量分数推荐拒答阈值。
+
+    阈值只做离线建议，不会在运行时自动改配置，避免小评测集把线上行为调坏。
+    """
+    labeled = [
+        (float(row.get("top_score", 0.0)), not bool(row.get("expect_no_answer")))
+        for row in per_query
+        if "top_score" in row
+    ]
+    positives = [score for score, should_answer in labeled if should_answer]
+    negatives = [score for score, should_answer in labeled if not should_answer]
+    if not positives or not negatives:
+        return {
+            "available": False,
+            "reason": "至少需要一个可答样例和一个应拒答样例",
+            "current_threshold": current_threshold,
+        }
+
+    unique = sorted({score for score, _ in labeled})
+    candidates = [unique[0] - 1e-6, unique[-1] + 1e-6]
+    candidates.extend((left + right) / 2 for left, right in zip(unique, unique[1:]))
+
+    def balanced_accuracy(threshold: float) -> float:
+        answer_recall = sum(score >= threshold for score in positives) / len(positives)
+        refusal_recall = sum(score < threshold for score in negatives) / len(negatives)
+        return (answer_recall + refusal_recall) / 2
+
+    best = max(
+        candidates,
+        key=lambda threshold: (
+            balanced_accuracy(threshold),
+            -abs(threshold - current_threshold),
+        ),
+    )
+    return {
+        "available": True,
+        "recommended_threshold": round(best, 4),
+        "balanced_accuracy": round(balanced_accuracy(best), 4),
+        "current_threshold": current_threshold,
+        "positive_score_range": [round(min(positives), 4), round(max(positives), 4)],
+        "negative_score_range": [round(min(negatives), 4), round(max(negatives), 4)],
+        "sample_count": len(labeled),
+    }
 
 
 def format_report(result: EvalResult) -> str:
@@ -268,6 +320,7 @@ def format_report(result: EvalResult) -> str:
         f" | 大模型改写 {result.rewrite_stats.get('llm_used', 0)} 次"
         f" / 降级 {result.rewrite_stats.get('llm_degraded', 0)} 次)",
         f"配置: {json.dumps(result.config, ensure_ascii=False)}",
+        f"拒答阈值标定: {json.dumps(result.threshold_calibration, ensure_ascii=False)}",
         "",
         "逐条结果:",
     ]
@@ -291,4 +344,11 @@ def format_report(result: EvalResult) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["EvalItem", "EvalResult", "load_eval_set", "evaluate", "format_report"]
+__all__ = [
+    "EvalItem",
+    "EvalResult",
+    "load_eval_set",
+    "evaluate",
+    "format_report",
+    "recommend_refusal_threshold",
+]

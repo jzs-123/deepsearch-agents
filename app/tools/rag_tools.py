@@ -138,6 +138,59 @@ def _filter_miss_message(kb: str, filter_spec: dict, pipeline) -> str:
     return f"知识库 {kb} 中{hint}"
 
 
+def _emit_search_sources(question: str, pipeline: RagPipeline, results: list, gate_score: float) -> None:
+    """把检索原文作为结构化事件交给前端，不依赖模型转述。"""
+    monitor.report_rag_sources(
+        {
+            "kb": pipeline.kb,
+            "question": question,
+            "grounded": gate_score >= pipeline.config.min_score,
+            "gate_score": round(gate_score, 4),
+            "threshold": pipeline.config.min_score,
+            "sources": [
+                {
+                    "rank": item.rank,
+                    "source": item.chunk.source,
+                    "source_path": item.chunk.source_path,
+                    "chunk_index": item.chunk.chunk_index,
+                    "heading": item.chunk.heading,
+                    "score": round(item.score, 4),
+                    "dense_score": round(item.dense_score, 4) if item.dense_score is not None else None,
+                    "text": item.chunk.text[:1200],
+                }
+                for item in results
+            ],
+        }
+    )
+
+
+def _emit_answer_sources(question: str, pipeline: RagPipeline, answer) -> None:
+    """上报实际送入答案生成器的上下文片段。"""
+    gate_score = float(answer.debug.get("gate_score", 0.0) or 0.0)
+    monitor.report_rag_sources(
+        {
+            "kb": pipeline.kb,
+            "question": question,
+            "grounded": bool(answer.citations) and gate_score >= pipeline.config.min_score,
+            "gate_score": round(gate_score, 4),
+            "threshold": pipeline.config.min_score,
+            "sources": [
+                {
+                    "rank": context.get("index", index),
+                    "source": context.get("source", ""),
+                    "source_path": "",
+                    "chunk_index": context.get("chunk_index", 0),
+                    "heading": context.get("heading", ""),
+                    "score": context.get("score", 0),
+                    "dense_score": None,
+                    "text": str(context.get("text", ""))[:1200],
+                }
+                for index, context in enumerate(answer.contexts, start=1)
+            ],
+        }
+    )
+
+
 @tool
 def search_knowledge_base(
     question: str, kb_name: str = "", top_n: int = 4, filter_json: str = ""
@@ -181,6 +234,7 @@ def search_knowledge_base(
         # 后者在开启重排后是「词面覆盖率/大模型打分」,尺度与 min_score 完全不同,
         # 混用会让无关问题越过阈值(同类问题见 docs/rag-self-built.md 5.10)。
         gate_score = pipeline.grounded_score(results)
+        _emit_search_sources(question, pipeline, results, gate_score)
         if gate_score < pipeline.config.min_score:
             return (
                 f"知识库 {pipeline.kb} 中没有与该问题足够相关的资料"
@@ -233,6 +287,7 @@ def ask_knowledge_base(question: str, kb_name: str = "", filter_json: str = "") 
             return f"知识库 {pipeline.kb} 是空的,没有可检索的文档。"
 
         answer = pipeline.query(question, filter=filter_spec)
+        _emit_answer_sources(question, pipeline, answer)
         if filter_spec and not answer.citations:
             return _filter_miss_message(pipeline.kb, filter_spec, pipeline)
         lines = [answer.answer]

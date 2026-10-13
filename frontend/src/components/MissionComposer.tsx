@@ -1,5 +1,6 @@
 import { PlayCircleOutlined, ThunderboltOutlined } from "@ant-design/icons";
 import { Button, Input } from "antd";
+import type { ChangeEvent } from "react";
 
 const { TextArea } = Input;
 
@@ -36,7 +37,7 @@ export function MissionComposer({
         aria-label="研搜任务"
         className="mission-textarea"
         value={query}
-        onChange={(event) => onQueryChange(event.target.value)}
+        onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onQueryChange(event.target.value)}
         placeholder="输入要交给 DeepAgents 的任务，例如：查询机器人信息，并生成 Markdown 和 PDF 文件。"
         autoSize={{ minRows: 7, maxRows: 12 }}
         disabled={isRunning}

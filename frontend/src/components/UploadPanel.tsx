@@ -21,7 +21,7 @@ function toUploadedItem(file: UploadFile): UploadedItem | null {
     uid: file.uid,
     name: file.name,
     size: file.size || 0,
-    raw: file.originFileObj
+    raw: file.originFileObj as unknown as File
   };
 }
 
@@ -38,9 +38,11 @@ export function UploadPanel({ isUploading, onUpload, uploadedItems }: UploadPane
       </div>
 
       <Dragger
-        multiple
         beforeUpload={() => false}
+        capture={undefined}
         className="upload-dropzone"
+        hasControlInside
+        multiple
         onChange={(info) => {
           setStagedItems(
             info.fileList
@@ -48,6 +50,7 @@ export function UploadPanel({ isUploading, onUpload, uploadedItems }: UploadPane
               .filter((item): item is UploadedItem => Boolean(item))
           );
         }}
+        pastable={false}
       >
         <p className="ant-upload-drag-icon">
           <InboxOutlined />

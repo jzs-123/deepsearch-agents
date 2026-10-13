@@ -17,7 +17,7 @@ import { Button, Tooltip } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { getDownloadUrl } from "../lib/api";
 import { MarkdownRenderer } from "./MarkdownRenderer";
-import type { ChatTurn, MonitorMessage, OutputFile } from "../types";
+import type { ChatTurn, MonitorMessage, OutputFile, RagSourceTrace } from "../types";
 
 interface ConversationThreadProps {
   onUseExample: (prompt: string) => void;
@@ -244,6 +244,65 @@ function ArtifactShelf({ files }: { files: OutputFile[] }) {
   );
 }
 
+function isRagSourceTrace(value: unknown): value is RagSourceTrace {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<RagSourceTrace>;
+  return typeof candidate.kb === "string" && Array.isArray(candidate.sources);
+}
+
+function SourceTrace({ events }: { events: MonitorMessage[] }) {
+  const traces: RagSourceTrace[] = [];
+  events.forEach((event) => {
+    if (event.event === "rag_sources" && isRagSourceTrace(event.data)) {
+      traces.push(event.data);
+    }
+  });
+
+  if (traces.length === 0) {
+    return null;
+  }
+
+  const sourceCount = traces.reduce((total, trace) => total + trace.sources.length, 0);
+  return (
+    <details className="source-trace" open>
+      <summary>
+        <span>
+          <FileSearchOutlined aria-hidden />
+          检索依据
+        </span>
+        <strong>{sourceCount}</strong>
+      </summary>
+      <div className="source-trace-runs">
+        {traces.map((trace, traceIndex) => (
+          <section className="source-trace-run" key={`${trace.kb}-${trace.question}-${traceIndex}`}>
+            <div className="source-trace-meta">
+              <span>{trace.kb}</span>
+              <span className={trace.grounded ? "source-gate source-gate--pass" : "source-gate"}>
+                {trace.grounded ? "依据充分" : "低于拒答阈值"} · {trace.gate_score.toFixed(3)} / {trace.threshold.toFixed(3)}
+              </span>
+            </div>
+            <p className="source-question">{trace.question}</p>
+            <ol className="source-list">
+              {trace.sources.map((source) => (
+                <li key={`${source.source}-${source.chunk_index}-${source.rank}`}>
+                  <div className="source-heading">
+                    <strong>{source.source} #{source.chunk_index}</strong>
+                    <span>{source.heading || "无标题"}</span>
+                    <code>{source.score.toFixed(3)}</code>
+                  </div>
+                  <p>{source.text}</p>
+                </li>
+              ))}
+            </ol>
+          </section>
+        ))}
+      </div>
+    </details>
+  );
+}
+
 function ThinkingLoader({ durationLabel }: { durationLabel: string }) {
   return (
     <div
@@ -335,6 +394,8 @@ function AssistantMessage({
           </div>
         )}
 
+        <SourceTrace events={events} />
+
         <details
           className="thinking-block artifact-block"
           open={files.length > 0}
@@ -361,11 +422,24 @@ export function ConversationThread({
     return (
       <div className="conversation-empty">
         <div className="empty-examples">
+          <div className="empty-orbit" aria-hidden>
+            <span className="orbit-core">DS</span>
+            <span className="orbit-ring orbit-ring--one">
+              <i />
+            </span>
+            <span className="orbit-ring orbit-ring--two">
+              <i />
+              <i />
+            </span>
+            <span className="orbit-label orbit-label--web">WEB</span>
+            <span className="orbit-label orbit-label--data">DATA</span>
+            <span className="orbit-label orbit-label--rag">RAG</span>
+          </div>
           <div className="empty-examples-copy">
-            <span className="panel-kicker">TASK EXAMPLES</span>
-            <h3>选择一个工具任务开始</h3>
+            <span className="panel-kicker">START A RESEARCH RUN</span>
+            <h3>一个问题，调动整支研究团队</h3>
             <p>
-              每个示例会触发不同工具路径，执行轨迹和输出文件会直接出现在对话里。
+              描述目标即可。主智能体会选择检索路径、调用工具，并把证据、过程与交付物放回这里。
             </p>
           </div>
 

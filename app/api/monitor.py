@@ -143,7 +143,23 @@ class ToolMonitor:
 
     def report_task_result(self, result: str) -> None:
         """报告任务最终结果"""
-        self._emit("task_result", "任务执行完成", {"result": result})
+        self._emit(
+            "task_result",
+            "任务执行完成",
+            {
+                "result": result,
+                "output": {
+                    "schema_version": "1.0",
+                    "status": "success",
+                    "answer": result,
+                },
+            },
+        )
+
+    def report_rag_sources(self, payload: dict[str, Any]) -> None:
+        """报告一次 RAG 检索使用的结构化原文依据。"""
+        count = len(payload.get("sources") or [])
+        self._emit("rag_sources", f"检索到 {count} 条知识库依据", payload)
 
     def report_task_cancelled(self) -> None:
         """报告任务已被用户取消"""

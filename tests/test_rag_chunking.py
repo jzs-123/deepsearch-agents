@@ -21,7 +21,9 @@ import pytest
 from app.rag.chunking import (
     _CN_HEADING,
     _MD_HEADING,
+    _is_bare_heading,
     _is_cn_title,
+    _split_glued_heading,
     _with_overlap,
     chunk_document,
 )
@@ -105,6 +107,66 @@ def test_cn_numbered_heading_still_works_when_genuine():
     chunks = chunk_document(doc, chunk_size=500, chunk_overlap=0)
     headings = {chunk.heading for chunk in chunks}
     assert {"一、总则", "二、细则"} <= headings
+
+
+# ── 裸标题兜底(OCR 简历/扫描件,docs/rag-self-built.md §5.21)────────
+
+
+def test_bare_heading_recognised_in_resume_like_text():
+    """无编号裸标题(基本信息/教育经历/项目经历)必须被识别为标题。"""
+    doc = _doc(
+        "基本信息\n姓名:孙子杰\n电话:187xxx\n\n"
+        "教育经历\n山东大学 数据科学与大数据技术\n在校荣誉:校级二等奖学金。\n\n"
+        "专业技能\n熟悉 Python、Docker 等工具,熟练使用各类 AI 开发工具。"
+    )
+    chunks = chunk_document(doc, chunk_size=500, chunk_overlap=0)
+    headings = {chunk.heading for chunk in chunks}
+    assert {"基本信息", "教育经历", "专业技能"} <= headings
+
+
+def test_bare_heading_body_short_line_is_not_misjudged():
+    """「山东济南」「中国香港」这类正文短行不在词表中,不能被误判成标题。"""
+    assert _is_bare_heading("山东济南") is False
+    assert _is_bare_heading("中国香港") is False
+    doc = _doc("教育经历\n山东大学\n山东济南\n在校荣誉:校级二等奖学金。")
+    chunks = chunk_document(doc, chunk_size=500, chunk_overlap=0)
+    # 「山东济南」必须留在正文里,而不是变成标题路径
+    assert "山东济南" in "\n".join(chunk.text for chunk in chunks)
+    assert not any("山东济南" in chunk.heading for chunk in chunks)
+
+
+def test_glued_heading_at_line_end_is_split_off():
+    """OCR 把标题粘在上一节句尾:「...后训练范式 。项目经历」→ 剥离成新节标题。"""
+    assert _split_glued_heading("熟悉大模型后训练范式 。项目经历") == (
+        "熟悉大模型后训练范式 。",
+        "项目经历",
+    )
+    doc = _doc(
+        "熟悉 ReAct 等 Agent 架构 。项目经历\n"
+        "深度研搜平台\n"
+        "基于 DeepAgents 与 LangGraph 搭建深度研究智能体系统。\n"
+    )
+    chunks = chunk_document(doc, chunk_size=500, chunk_overlap=0)
+    assert "项目经历" in {chunk.heading for chunk in chunks}
+    # 标题前的正文必须留在上一节,不能被吃掉
+    assert any("熟悉 ReAct 等 Agent 架构" in chunk.text for chunk in chunks)
+
+
+def test_glued_heading_requires_sentence_punctuation_before_word():
+    """行尾词组前没有句末标点(如「对全文进行总结」)不能当标题剥离。"""
+    assert _split_glued_heading("对全文进行总结") is None
+    assert _split_glued_heading("本章先介绍背景知识再展开总结") is None
+
+
+def test_bare_heading_nests_under_existing_top_heading():
+    """文档已有 # 一级标题时,裸标题挂在其下,不吞掉一级路径。"""
+    doc = _doc(
+        "# 张三的简历\n\n基本信息\n姓名:张三\n\n项目经历\n做了某系统。"
+    )
+    chunks = chunk_document(doc, chunk_size=500, chunk_overlap=0)
+    headings = {chunk.heading for chunk in chunks}
+    assert "张三的简历 > 基本信息" in headings
+    assert "张三的简历 > 项目经历" in headings
 
 
 # ── 重叠窗口 ─────────────────────────────────────────────────────────

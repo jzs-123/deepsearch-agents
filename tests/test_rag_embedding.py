@@ -116,6 +116,33 @@ def test_local_embedder_is_lazy():
     assert LocalEmbedder()._model is None
 
 
+def test_local_embedder_checks_cache_before_network(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    calls = []
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name, **kwargs):
+            calls.append({"model_name": model_name, **kwargs})
+
+        def get_embedding_dimension(self):
+            return 3
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+    )
+    embedder = LocalEmbedder(model_name="cached-model", device="cpu")
+    embedder._load()
+
+    assert calls == [
+        {"model_name": "cached-model", "device": "cpu", "local_files_only": True}
+    ]
+    assert embedder.dim == 3
+
+
 @pytest.mark.skipif(
     _has_sentence_transformers(), reason="本机装了 sentence-transformers，不适用缺失分支"
 )

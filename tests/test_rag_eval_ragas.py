@@ -85,7 +85,8 @@ def test_check_ragas_available_reports_missing_in_this_environment():
     assert "pip install ragas datasets" in message
 
 
-def test_require_ragas_raises_runtime_error_with_hint():
+def test_require_ragas_raises_runtime_error_with_hint(monkeypatch):
+    monkeypatch.setattr("app.rag.eval_ragas.missing_packages", lambda: ["ragas", "datasets"])
     with pytest.raises(RuntimeError) as excinfo:
         require_ragas()
     assert "pip install ragas datasets" in str(excinfo.value)
@@ -341,7 +342,8 @@ def test_run_evaluation_with_injected_stub_evaluator():
     assert report["metrics"]["faithfulness"] == 0.42
 
 
-def test_run_evaluation_without_stub_raises_clear_error_in_this_environment():
+def test_run_evaluation_without_stub_raises_clear_error_in_this_environment(monkeypatch):
+    monkeypatch.setattr("app.rag.eval_ragas.missing_packages", lambda: ["ragas", "datasets"])
     with pytest.raises(RuntimeError, match="pip install ragas datasets"):
         run_evaluation(_records(), DEFAULT_METRICS)
 

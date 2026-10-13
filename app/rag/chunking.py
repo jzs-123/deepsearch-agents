@@ -38,6 +38,16 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[。！？；!?;])")
 _FENCE = re.compile(r"^\s*```")
 # 标题里不应该出现的标点:出现说明这一行是正文而非标题(中文编号标题没有 #,只能靠这个区分)
 _TITLE_PUNCT = "。！？；!?;，,、"
+# 裸标题词表:无编号、无 # 前缀的短行标题(简历/扫描件/OCR 文本常见,如「基本信息」「项目经历」)。
+# 之所以用词表而不是纯长度启发:OCR 文本里「山东济南」「中国香港」这类正文短行与标题
+# 形态几乎无法区分,词表 + 结构双条件才能把误判压住(docs/rag-self-built.md §5.21)。
+_BARE_HEADING_WORDS = (
+    "基本信息", "个人信息", "教育经历", "教育背景", "工作经历", "工作背景",
+    "实习经历", "实习经验", "项目经历", "项目经验", "校园经历", "校园经验",
+    "专业技能", "技能特长", "荣誉奖项", "获奖情况", "自我评价", "个人优势",
+    "兴趣爱好", "语言能力", "证书情况",
+    "前言", "引言", "概述", "总结", "展望", "附录", "参考文献", "致谢",
+)
 
 
 @dataclass
@@ -63,6 +73,37 @@ def _is_cn_title(tail: str) -> bool:
     if len(tail) > 30:
         return False
     return not any(ch in tail for ch in _TITLE_PUNCT)
+
+
+def _is_bare_heading(line: str) -> bool:
+    """判断一行是不是「无编号裸标题」(如简历里的「基本信息」「项目经历」)。
+
+    结构条件:整行去空白后不超过 12 字、不含句读标点;
+    内容条件:命中词表(或以词表词条开头,如「教育经历与荣誉」)。
+    两条都满足才认为是标题,这样「山东济南」「中国香港」等正文短行不会被误判。
+    """
+    stripped = line.strip()
+    if not stripped or len(stripped) > 12:
+        return False
+    if any(ch in stripped for ch in _TITLE_PUNCT):
+        return False
+    return any(stripped.startswith(word) for word in _BARE_HEADING_WORDS)
+
+
+def _split_glued_heading(line: str) -> tuple[str, str] | None:
+    """剥离行尾粘连的裸标题(OCR 文本常见)。
+
+    「...熟悉大模型后训练范式 。项目经历」这行里,标题粘在了上一节正文的句尾。
+    返回 (剩余正文, 标题);标题前一个字符必须是句末标点,否则视为普通词组
+    (如「对全文进行总结」的结尾「总结」),避免把正文切走。
+    """
+    stripped = line.rstrip()
+    for word in _BARE_HEADING_WORDS:
+        if stripped.endswith(word):
+            head = stripped[: -len(word)].rstrip()
+            if head and head[-1] in "。！？；!?;：: \t":
+                return head, word
+    return None
 
 
 def _split_headings(text: str) -> list[tuple[str, int, str]]:
@@ -101,18 +142,45 @@ def _split_headings(text: str) -> list[tuple[str, int, str]]:
                 # 形似编号但其实是正文(如「一、核心结论金融与电商正在加速融合。」),
                 # 放弃标题判定,当作普通段落处理,否则标题会被粘上正文句子
                 cn_match = None
-            if md_match or cn_match:
+            bare = (md_match or cn_match) is None and _is_bare_heading(line)
+            # 行尾粘连的裸标题(OCR 常见):「...后训练范式 。项目经历」——标题留在
+            # 上一节句尾。先把剩余正文留给上一节,再从标题处开启新节。
+            glued = (
+                None
+                if (md_match or cn_match or bare)
+                else _split_glued_heading(line)
+            )
+            if glued:
+                head, bare_title = glued
+                if head.strip():
+                    if not buffer:
+                        body_start = cursor
+                    buffer.append(head)
+                flush()
+                buffer = []
+                body_start = cursor + line_len
+                # 裸标题按二级挂靠:保留既有一级标题的路径;无一级标题时效果等同一级
+                stack = stack[:1]
+                stack.append(bare_title)
+                current_path = " > ".join([item for item in stack if item])
+                cursor += line_len
+                continue
+            if md_match or cn_match or bare:
                 flush()
                 buffer = []
                 body_start = cursor + line_len
                 if md_match:
                     level = len(md_match.group(1))
                     title = md_match.group(2).strip()
-                else:
+                elif cn_match:
                     title = line.strip()
                     numbering = cn_match.group(1).strip()
                     # 中文编号标题没有显式层级,按编号里点数推断深度
                     level = numbering.count(".") + 1
+                else:
+                    # 裸标题(如「基本信息」):按二级挂靠,理由同上
+                    title = line.strip()
+                    level = 2
                 stack = stack[: level - 1]
                 while len(stack) < level - 1:
                     stack.append("")

@@ -36,6 +36,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.agent.main_agent import run_deep_agent
+from app.api.knowledge_bases import normalize_kb_name, public_kb_summary, safe_upload_name
 from app.api.monitor import manager, monitor
 from app.core.config import settings
 from app.core.logging import (
@@ -82,6 +83,12 @@ output_dir.mkdir(exist_ok=True)
 # updated 暂存用户上传文件,run_deep_agent 启动时会复制到对应 output/session_xxx
 updated_dir = project_root / "updated"
 updated_dir.mkdir(exist_ok=True)
+
+kb_upload_dir = updated_dir / "knowledge_bases"
+kb_upload_dir.mkdir(exist_ok=True)
+
+MAX_KB_FILE_BYTES = 50 * 1024 * 1024
+_kb_ingest_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 # ─── 中间件 ──────────────────────────────────────────────────
@@ -249,6 +256,82 @@ async def upload_files(files: List[UploadFile] = File(...), thread_id: str = For
         saved_files.append(file.filename)
 
     return {"status": "uploaded", "files": saved_files}
+
+
+@app.get("/api/knowledge-bases")
+async def get_knowledge_bases():
+    """列出前端可选择的知识库及规模信息。"""
+    from app.rag.config import load_rag_config
+    from app.rag.vectorstore import list_knowledge_bases
+
+    config = load_rag_config()
+    bases = list_knowledge_bases(config.data_path)
+    return {
+        "default_kb": config.default_kb,
+        "knowledge_bases": [public_kb_summary(item, config.vectorstore) for item in bases],
+    }
+
+
+@app.post("/api/knowledge-bases/ingest")
+async def ingest_knowledge_base(
+    files: List[UploadFile] = File(...),
+    kb_name: str = Form(...),
+    document_key: str = Form(""),
+    revision_id: str = Form(""),
+    effective_from: str = Form(""),
+):
+    """上传文档并直接入库；同一 document_key 的新版本会替换旧版本。"""
+    try:
+        safe_kb = normalize_kb_name(kb_name)
+        if not files:
+            raise ValueError("请至少选择一个文件")
+        if len(files) > 1 and any((document_key, revision_id, effective_from)):
+            raise ValueError("文档身份和版本字段只适用于单文件上传")
+        safe_names = [safe_upload_name(file.filename or "") for file in files]
+        if len(set(safe_names)) != len(safe_names):
+            raise ValueError("一次上传中不能包含同名文件")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    batch_dir = kb_upload_dir / f"{safe_kb}_{uuid.uuid4().hex}"
+    batch_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        for upload, safe_name in zip(files, safe_names):
+            target = batch_dir / safe_name
+            written = 0
+            with target.open("wb") as buffer:
+                while chunk := await upload.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > MAX_KB_FILE_BYTES:
+                        raise HTTPException(status_code=413, detail=f"{safe_name} 超过 50MB 限制")
+                    buffer.write(chunk)
+
+        async with _kb_ingest_locks[safe_kb]:
+            def run_ingest():
+                from app.rag.pipeline import clear_pipeline_cache, get_pipeline
+
+                pipeline = get_pipeline(kb=safe_kb, create=True)
+                source = batch_dir / safe_names[0] if len(safe_names) == 1 else batch_dir
+                report = pipeline.ingest(
+                    source,
+                    document_key=document_key.strip() or None,
+                    revision_id=revision_id.strip() or None,
+                    effective_from=effective_from.strip() or None,
+                )
+                clear_pipeline_cache()
+                return report.to_dict()
+
+            report = await asyncio.to_thread(run_ingest)
+        return {"status": "indexed", "report": report}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("知识库入库失败 kb=%s", safe_kb)
+        raise HTTPException(status_code=500, detail=f"知识库入库失败：{exc}") from exc
+    finally:
+        for upload in files:
+            await upload.close()
+        shutil.rmtree(batch_dir, ignore_errors=True)
 
 
 @app.get("/api/download")

@@ -49,6 +49,9 @@ class ChatClient:
     base_url: str = ""
     temperature: float = 0.1
     timeout: float = 120.0
+    # 推理模型思维链开关:"disabled" 关闭 / "enabled" 开启 / "" 不传(跟随服务端默认)。
+    # 思维链与正文共享 max_tokens,复杂上下文下思考可耗尽预算致 content 为空(§5.20)。
+    thinking: str = "disabled"
 
     def __post_init__(self) -> None:
         self._client = None
@@ -68,6 +71,17 @@ class ChatClient:
             )
         return self._client
 
+    def _extra_body(self) -> dict:
+        """思维链开关走 extra_body 注入(`thinking: {"type": ...}`,DeepSeek 原生参数)。
+
+        放 extra_body 而不是顶层字段:openai SDK 不认识这个参数,直接传会报
+        "unexpected keyword";extra_body 会原样并入请求 JSON,不支持的网关最多
+        忽略它(探测验证过 chat_template_kwargs 等参数就是被静默忽略的)。
+        """
+        if self.thinking in ("disabled", "enabled"):
+            return {"thinking": {"type": self.thinking}}
+        return {}
+
     def complete(self, system_prompt: str, user_prompt: str, max_tokens: int = 1200) -> str:
         """发起一次对话补全。"""
         client = self._ensure()
@@ -79,8 +93,32 @@ class ChatClient:
             ],
             temperature=self.temperature,
             max_tokens=max_tokens,
+            extra_body=self._extra_body(),
         )
-        return (response.choices[0].message.content or "").strip()
+        choice = response.choices[0]
+        text = (choice.message.content or "").strip()
+        # 推理模型(如 deepseek-v4-pro)的思维链会与正文共享 max_tokens 预算:
+        # 上下文复杂/噪声多时,思考就能耗光 1200 tokens(finish_reason=length 且
+        # reasoning_tokens=1199),content 一个字没生成就被截断。生成层拿到空文本
+        # 会套上拒答模板,被误判成「模型拒答」——必须在这里放大预算重试一次。
+        # (若 thinking 已设为 disabled,正常不会走到这里;重试是最后一道保险。)
+        if not text and choice.finish_reason == "length":
+            retry_tokens = max(4096, max_tokens * 4)
+            logger.warning(
+                "模型思维链耗尽 %s tokens 致正文为空,放大至 %s 重试", max_tokens, retry_tokens
+            )
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=self.temperature,
+                max_tokens=retry_tokens,
+                extra_body=self._extra_body(),
+            )
+            text = (response.choices[0].message.content or "").strip()
+        return text
 
     @property
     def raw(self):

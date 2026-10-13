@@ -8,12 +8,14 @@ import {
   DeleteOutlined,
   FileSearchOutlined,
   HistoryOutlined,
+  PlusOutlined,
   ToolOutlined
 } from "@ant-design/icons";
 import { Alert, App as AntApp, Button } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { ChatComposer } from "./components/ChatComposer";
 import { ConversationThread } from "./components/ConversationThread";
+import { KnowledgeBaseManager } from "./components/KnowledgeBaseManager";
 import { API_BASE_URL, WS_BASE_URL } from "./lib/config";
 import { restoreChatTurns } from "./lib/history";
 import { useDeepAgentSession } from "./hooks/useDeepAgentSession";
@@ -46,6 +48,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [stagedItems, setStagedItems] = useState<UploadedItem[]>([]);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const [knowledgeBaseOpen, setKnowledgeBaseOpen] = useState(false);
   const activeTurnIdRef = useRef<string | null>(null);
   const streamRef = useRef<HTMLElement | null>(null);
   const session = useDeepAgentSession();
@@ -154,22 +157,39 @@ export default function App() {
     <div className="chat-app-shell min-h-dvh">
       <aside className="chat-sidebar" aria-label="会话信息">
         <div className="sidebar-brand">
-          <span className="panel-kicker">DEEPSEARCH</span>
-          <h1>深度研搜</h1>
-          <p>对话式多智能体研究台</p>
+          <span className="brand-mark" aria-hidden>
+            <i />
+            <i />
+            <i />
+          </span>
+          <div>
+            <span className="panel-kicker">DEEPSEARCH OS</span>
+            <h1>深度研搜</h1>
+            <p>多智能体研究工作台</p>
+          </div>
         </div>
 
-        <Button className="new-chat-button" block onClick={handleNewSession}>
+        <Button className="new-chat-button" block icon={<PlusOutlined />} onClick={handleNewSession}>
           新建研搜
         </Button>
+        <Button
+          block
+          className="kb-manage-button"
+          icon={<DatabaseOutlined />}
+          onClick={() => setKnowledgeBaseOpen(true)}
+        >
+          上传知识库
+        </Button>
 
-        <div className="sidebar-section">
-          <span className="sidebar-label">THREAD</span>
+        <div className="sidebar-thread">
+          <span className="sidebar-label">ACTIVE THREAD</span>
           <strong className="thread-id" title={session.threadId}>
             {session.threadId.slice(0, 8)}
           </strong>
+          <span className="thread-signal">实时上下文已连接</span>
         </div>
 
+        <span className="sidebar-label">SYSTEM PULSE</span>
         <div className="sidebar-status-list">
           <div className={`sidebar-status ${online ? "sidebar-status--online" : "sidebar-status--warn"}`}>
             <ApiOutlined aria-hidden />
@@ -195,55 +215,43 @@ export default function App() {
 
         <div className="sidebar-section">
           <span className="sidebar-label">
-            <HistoryOutlined aria-hidden /> HISTORY
+            <HistoryOutlined aria-hidden /> RECENT THREADS
           </span>
           {session.sessionList.length === 0 ? (
-            <p style={{ color: "rgba(20,38,60,0.45)", fontSize: 12, margin: 0, padding: "4px 0" }}>
+            <p className="history-empty">
               暂无历史会话
             </p>
           ) : (
-            <ul className="history-list" style={{ listStyle: "none", margin: 0, padding: 0 }}>
+            <ul className="history-list">
               {session.sessionList.map((s) => (
                 <li
                   key={s.thread_id}
                   className={s.thread_id === session.threadId ? "history-item history-item--active" : "history-item"}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    padding: "6px 8px",
-                    borderRadius: 4,
-                    cursor: "pointer",
-                    fontSize: 12,
-                    color: s.thread_id === session.threadId ? "#0284c7" : "rgba(20,38,60,0.72)",
-                    background: s.thread_id === session.threadId ? "rgba(2,132,199,0.10)" : "transparent",
-                    transition: "background 0.15s",
-                    gap: 4,
-                  }}
-                  onClick={() => {
-                    if (s.thread_id !== session.threadId) {
-                      void handleLoadSession(s.thread_id);
-                    }
-                  }}
                 >
-                  <span
-                    style={{
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      flex: 1,
+                  <button
+                    className="history-entry"
+                    onClick={() => {
+                      if (s.thread_id !== session.threadId) {
+                        void handleLoadSession(s.thread_id);
+                      }
                     }}
+                    type="button"
                   >
-                    {s.title || s.thread_id.slice(0, 8)}
-                  </span>
-                  <DeleteOutlined
-                    aria-label="删除会话"
-                    style={{ fontSize: 11, color: "rgba(20,38,60,0.4)", flexShrink: 0 }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      session.deleteSession(s.thread_id);
+                    <span className="history-index" aria-hidden />
+                    <span className="history-title">
+                      {s.title || s.thread_id.slice(0, 8)}
+                    </span>
+                  </button>
+                  <button
+                    aria-label={`删除会话 ${s.title || s.thread_id.slice(0, 8)}`}
+                    className="history-delete"
+                    onClick={() => {
+                      void session.deleteSession(s.thread_id);
                     }}
-                  />
+                    type="button"
+                  >
+                    <DeleteOutlined aria-hidden />
+                  </button>
                 </li>
               ))}
             </ul>
@@ -251,7 +259,7 @@ export default function App() {
         </div>
 
         <div className="sidebar-section">
-          <span className="sidebar-label">AGENTS</span>
+          <span className="sidebar-label">AGENT NETWORK</span>
           <ul className="agent-mini-list">
             <li>
               <CloudServerOutlined aria-hidden />
@@ -278,8 +286,9 @@ export default function App() {
       <main className="chat-main">
         <header className="chat-topbar">
           <div>
-            <span className="panel-kicker">CHAT WORKSPACE</span>
-            <h2>深度研搜对话</h2>
+            <span className="panel-kicker">RESEARCH CANVAS</span>
+            <h2>把问题变成证据链</h2>
+            <p className="topbar-subtitle">检索、推理与交付，在同一条对话里完成</p>
           </div>
           <div className={`run-indicator ${session.isRunning ? "run-indicator--live" : ""}`}>
             {session.isRunning ? <BranchesOutlined aria-hidden /> : <CheckCircleOutlined aria-hidden />}
@@ -318,6 +327,10 @@ export default function App() {
           uploadedItems={session.uploadedItems}
         />
       </main>
+      <KnowledgeBaseManager
+        onClose={() => setKnowledgeBaseOpen(false)}
+        open={knowledgeBaseOpen}
+      />
     </div>
   );
 }

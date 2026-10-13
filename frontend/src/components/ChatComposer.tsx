@@ -32,7 +32,7 @@ function toUploadedItem(file: UploadFile): UploadedItem | null {
     uid: file.uid,
     name: file.name,
     size: file.size || 0,
-    raw: file.originFileObj
+    raw: file.originFileObj as unknown as File
   };
 }
 
@@ -117,7 +117,7 @@ export function ChatComposer({
               onSubmit();
             }
           }}
-          placeholder="向 DeepSearch Agents 发送任务..."
+          placeholder="输入研究目标，或上传资料开始分析…"
           value={query}
         />
 
@@ -134,11 +134,14 @@ export function ChatComposer({
             </Tooltip>
             <Upload
               beforeUpload={() => false}
+              capture={undefined}
               fileList={[]}
+              hasControlInside
               multiple
               onChange={(info) => {
                 handleAttachmentChange(info.fileList.length > 0 ? info.fileList : [info.file]);
               }}
+              pastable={false}
               showUploadList={false}
             >
               <Tooltip title="选择附件">
@@ -151,6 +154,7 @@ export function ChatComposer({
                 />
               </Tooltip>
             </Upload>
+            <span className="composer-hint">Enter 发送 · Shift + Enter 换行</span>
           </div>
 
           <Tooltip title={isRunning ? "取消当前任务" : "发送任务"}>

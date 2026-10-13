@@ -51,6 +51,7 @@ class RagConfig:
     top_k: int = 10
     top_n: int = 4
     rrf_k: int = 60
+    sparse_enabled: bool = True
     rerank_mode: str = "lexical"
     min_score: float = 0.2
 
@@ -94,6 +95,9 @@ class RagConfig:
     llm_api_key: str = ""
     llm_temperature: float = 0.1
     llm_timeout: float = 120.0
+    # 推理模型思维链开关:"disabled" 关闭 / "enabled" 开启 / "" 不传(跟随服务端默认)。
+    # 思维链与正文共享 max_tokens,复杂上下文下思考可耗尽预算致 content 为空(§5.20)。
+    llm_thinking: str = "disabled"
 
     def __post_init__(self) -> None:
         if self.embedding_provider not in EMBEDDING_PROVIDERS:
@@ -123,6 +127,8 @@ class RagConfig:
             )
         if self.ocr_min_text_chars < 0:
             raise ValueError("ocr_min_text_chars 不能为负数(0 表示关闭页级 OCR)")
+        if self.llm_thinking not in ("", "disabled", "enabled"):
+            raise ValueError("llm_thinking 必须是 ''(不传) / 'disabled' / 'enabled' 之一")
         if self.vectorstore not in VECTORSTORE_BACKENDS:
             raise ValueError(
                 f"vectorstore 必须是 {VECTORSTORE_BACKENDS} 之一,当前为 {self.vectorstore!r}"
@@ -181,6 +187,7 @@ def load_rag_config(**overrides) -> RagConfig:
         top_k=settings.rag_top_k,
         top_n=settings.rag_top_n,
         rrf_k=settings.rag_rrf_k,
+        sparse_enabled=settings.rag_sparse_enabled,
         rerank_mode=settings.rag_rerank_mode,
         min_score=settings.rag_min_score,
         query_rewrite=settings.rag_query_rewrite,
@@ -197,6 +204,7 @@ def load_rag_config(**overrides) -> RagConfig:
         llm_model=settings.llm_model,
         llm_base_url=settings.openai_base_url,
         llm_api_key=settings.openai_api_key,
+        llm_thinking=settings.llm_thinking,
     )
     return replace(base, **overrides) if overrides else base
 

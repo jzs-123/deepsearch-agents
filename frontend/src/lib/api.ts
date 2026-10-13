@@ -2,6 +2,8 @@ import { API_BASE_URL } from "./config";
 import type {
   CancelTaskResponse,
   FileListResponse,
+  KnowledgeBaseIngestResponse,
+  KnowledgeBaseListResponse,
   SessionDetail,
   SessionListResponse,
   TaskResponse,
@@ -60,6 +62,29 @@ export async function uploadSessionFiles(
   return requestJson<UploadResponse>(apiUrl("/api/upload"), {
     method: "POST",
     body: formData
+  });
+}
+
+export async function listKnowledgeBases(): Promise<KnowledgeBaseListResponse> {
+  return requestJson<KnowledgeBaseListResponse>(apiUrl("/api/knowledge-bases"));
+}
+
+export async function ingestKnowledgeBase(input: {
+  kbName: string;
+  files: File[];
+  documentKey?: string;
+  revisionId?: string;
+  effectiveFrom?: string;
+}): Promise<KnowledgeBaseIngestResponse> {
+  const formData = new FormData();
+  formData.append("kb_name", input.kbName);
+  input.files.forEach((file) => formData.append("files", file));
+  formData.append("document_key", input.documentKey || "");
+  formData.append("revision_id", input.revisionId || "");
+  formData.append("effective_from", input.effectiveFrom || "");
+  return requestJson<KnowledgeBaseIngestResponse>(apiUrl("/api/knowledge-bases/ingest"), {
+    method: "POST",
+    body: formData,
   });
 }
 

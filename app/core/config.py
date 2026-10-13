@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     # 兼容两套历史变量:优先 LLM_DEEPSEEK,回退 LLM_QWEN_MAX
     llm_deepseek: str = ""
     llm_qwen_max: str = "qwen-max"
+    # 推理模型思维链开关:disabled/enabled/空(不传,跟随服务端默认)。
+    # 思维链与正文共享 max_tokens,RAG 问答属「依据检索结果抽取摘要」任务,
+    # 不需要长链推理,默认关掉(见 docs/rag-self-built.md §5.20)。
+    llm_thinking: str = "disabled"
 
     # ─── Tavily ───────────────────────────────────────────
     tavily_api_key: str = ""
@@ -72,6 +76,8 @@ class Settings(BaseSettings):
     rag_rerank_mode: str = "lexical"
     # 混合检索中稀疏路(BM25)与稠密路的 RRF 融合常数
     rag_rrf_k: int = 60
+    # 是否启用 BM25 稀疏路。超大知识库使用远程 Qdrant 时可关闭，避免首查加载全部 chunk。
+    rag_sparse_enabled: bool = True
     # 低于该相似度视为「知识库中没有依据」,直接拒答而不是让模型编造
     rag_min_score: float = 0.2
     # ─── 自研 RAG:向量存储后端 ─────────────────────────────

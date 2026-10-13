@@ -50,6 +50,18 @@ from app.rag.vectorstore import EmbeddingMismatchError, open_vectorstore
 logger = logging.getLogger(__name__)
 
 
+def _embed_input(chunk: Chunk) -> str:
+    """向量编码用的文本:heading 前置参与语义编码。
+
+    与 BM25 的「标题参与索引」策略对齐(bm25.py 里 tokenize 的输入同样是
+    heading + text):「孙子杰的项目经历」这类 query 能直接命中 heading 含
+    「项目经历」的 chunk。注意 chunk.text 本身不变——持久化/展示/引用仍是原文。
+    """
+    if chunk.heading:
+        return f"{chunk.heading}\n{chunk.text}"
+    return chunk.text
+
+
 def _normalize_document_key(value: str) -> str:
     """把业务文档身份规范成稳定值；路径分隔符和大小写不影响身份。"""
     key = str(value or "").strip().replace("\\", "/").casefold()
@@ -285,7 +297,7 @@ class RagPipeline:
                     replacement_ids.add(old.doc_id)
 
             pending_chunks.extend(chunks)
-            pending_texts.extend(chunk.text for chunk in chunks)
+            pending_texts.extend(_embed_input(chunk) for chunk in chunks)
             report.files_indexed += 1
             detail = {
                 "file": doc.source_path,
@@ -392,7 +404,7 @@ class RagPipeline:
                 chunks.append(chunk)
         if not chunks:
             return 0
-        vectors = self._encode_documents([c.text for c in chunks])
+        vectors = self._encode_documents([_embed_input(c) for c in chunks])
         # 与文件入库保持一致：向量化成功后再清掉同一来源的旧版本。
         replacement_ids = {stable_doc_id}
         for old in self.store.all_chunks():
@@ -518,7 +530,11 @@ class RagPipeline:
             dense_hits = [
                 (hit.chunk, hit.score) for hit in self.store.search(query_vector, top_k)
             ]
-            sparse_hits = self._bm25_index().search(question, top_k)
+            sparse_hits = (
+                self._bm25_index().search(question, top_k)
+                if self.config.sparse_enabled
+                else []
+            )
             fusion = hybrid_search(dense_hits, sparse_hits, top_k=top_k, rrf_k=self.config.rrf_k)
             info = {
                 "variant_hits": [
@@ -542,7 +558,11 @@ class RagPipeline:
             dense_hits = [
                 (hit.chunk, hit.score) for hit in self.store.search(query_vector, top_k)
             ]
-            sparse_hits = self._bm25_index().search(variant, top_k)
+            sparse_hits = (
+                self._bm25_index().search(variant, top_k)
+                if self.config.sparse_enabled
+                else []
+            )
             ranked_lists[f"dense@v{index}"] = dense_hits
             ranked_lists[f"sparse@v{index}"] = sparse_hits
             for chunk, score in dense_hits:
@@ -923,6 +943,7 @@ class RagPipeline:
             base_url=self.config.llm_base_url,
             temperature=self.config.llm_temperature,
             timeout=self.config.llm_timeout,
+            thinking=self.config.llm_thinking,
         )
         return client if client.available else None
 
@@ -1145,7 +1166,10 @@ def get_pipeline(
         kb_name,
         config.embedding_provider,
         config.embedding_model,
+        config.vectorstore,
+        config.qdrant_url,
         config.chunk_size,
+        config.sparse_enabled,
         config.cache_enabled,
         config.audit_enabled,
         create,
