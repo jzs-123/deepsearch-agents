@@ -16,6 +16,12 @@ function apiUrl(path: string): string {
   return `${API_BASE_URL}${path}`;
 }
 
+export class ApiError extends Error {
+  constructor(message: string, public status: number, public retryAfterMs = 60000) {
+    super(message);
+  }
+}
+
 async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await fetch(input, { ...init, credentials: "include" });
   const contentType = response.headers.get("content-type") || "";
@@ -28,14 +34,16 @@ async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Pro
       typeof payload === "object" && payload && "detail" in payload
         ? String(payload.detail)
         : `HTTP ${response.status}`;
-    throw new Error(message);
+    const seconds = Number(response.headers.get("Retry-After"));
+    const retryAfterMs = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 60000;
+    throw new ApiError(message, response.status, retryAfterMs);
   }
 
   return payload as T;
 }
 
-export function fetchAuthStatus(): Promise<{ enabled: boolean; authenticated: boolean; user_id?: string }> {
-  return requestJson(apiUrl("/api/auth/status"));
+export function fetchAuthStatus(signal?: AbortSignal): Promise<{ enabled: boolean; authenticated: boolean; user_id?: string }> {
+  return requestJson(apiUrl("/api/auth/status"), { signal });
 }
 
 export function loginWithApiKey(apiKey: string): Promise<{ user_id: string; tenant_id: string }> {

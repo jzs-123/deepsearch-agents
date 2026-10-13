@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ApiError,
   cancelTask,
   deleteSessionApi,
   fetchSessionDetail,
@@ -222,6 +223,7 @@ export function useDeepAgentSession() {
     let timer: number;
     async function recover() {
       const epoch = requestEpochRef.current;
+      let delay = connectionState === "connected" ? 15000 : 5000;
       try {
         const { task } = await fetchLatestTask(threadId);
         if (disposed || epoch !== requestEpochRef.current || !task) return;
@@ -231,6 +233,7 @@ export function useDeepAgentSession() {
           setEvents([]);
         }
         const display = taskDisplay(task);
+        if (!display.isRunning) delay = 30000;
         if (!display.isRunning) terminalTaskIdRef.current = task.task_id;
         if (!display.isRunning || terminalTaskIdRef.current !== task.task_id) {
           setIsRunning(display.isRunning);
@@ -266,32 +269,48 @@ export function useDeepAgentSession() {
             }
           }
         } while (page.events.length === 500);
-      } catch {
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 429) delay = Math.max(delay, error.retryAfterMs);
         // 新会话尚未创建或连接暂时不可用，下次补发继续。
       } finally {
-        if (!disposed) timer = window.setTimeout(recover, 5000);
+        if (!disposed) timer = window.setTimeout(recover, delay);
       }
     }
     void recover();
     return () => { disposed = true; window.clearTimeout(timer); };
-  }, [threadId]);
+  }, [threadId, connectionState]);
 
   useEffect(() => {
     if (!sessionPath) {
       return;
     }
 
-    refreshFiles().catch((error: unknown) => {
-      setLastError(error instanceof Error ? error.message : "文件列表刷新失败");
-    });
-
-    const timer = window.setInterval(() => {
-      refreshFiles().catch((error: unknown) => {
-        setLastError(error instanceof Error ? error.message : "文件列表刷新失败");
-      });
-    }, isRunning ? 2500 : 6000);
-
-    return () => window.clearInterval(timer);
+    let disposed = false;
+    let timer: number;
+    let fileError = "";
+    async function pollFiles() {
+      let delay = 5000;
+      let limited = false;
+      try {
+        await refreshFiles();
+        if (!disposed && fileError) {
+          const recoveredError = fileError;
+          setLastError((previous) => previous === recoveredError ? "" : previous);
+          fileError = "";
+        }
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 429) {
+          limited = true;
+          delay = Math.max(delay, error.retryAfterMs);
+        }
+        fileError = error instanceof Error ? error.message : "文件列表刷新失败";
+        if (!disposed) setLastError(fileError);
+      } finally {
+        if (!disposed && (isRunning || limited)) timer = window.setTimeout(pollFiles, delay);
+      }
+    }
+    void pollFiles();
+    return () => { disposed = true; window.clearTimeout(timer); };
   }, [isRunning, refreshFiles, sessionPath]);
 
   const submitTask = useCallback(

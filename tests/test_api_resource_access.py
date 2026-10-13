@@ -60,6 +60,30 @@ def _login(client, key):
     return response
 
 
+def test_rate_limit_has_cors_retry_and_request_id_and_does_not_count_preflight(api_client):
+    client, server = api_client
+    middleware = server.app.middleware_stack
+    while not isinstance(middleware, server.RateLimitMiddleware):
+        middleware = middleware.app
+    middleware.per_minute = 1
+    middleware._hits.clear()
+    origin = {"Origin": "http://localhost:5173"}
+    preflight = client.options("/api/health", headers={
+        **origin, "Access-Control-Request-Method": "GET",
+    })
+    assert preflight.status_code == 200
+    assert client.get("/api/health", headers=origin).status_code == 200
+    blocked = client.get("/api/health", headers=origin)
+    assert blocked.status_code == 429
+    assert blocked.headers["Access-Control-Allow-Origin"] == origin["Origin"]
+    assert blocked.headers["Access-Control-Allow-Credentials"] == "true"
+    assert "Retry-After" in blocked.headers["Access-Control-Expose-Headers"]
+    assert 1 <= int(blocked.headers["Retry-After"]) <= 60
+    assert blocked.headers["X-Request-ID"]
+    denied = client.get("/api/health", headers={"Origin": "https://untrusted.example"})
+    assert "Access-Control-Allow-Origin" not in denied.headers
+
+
 def test_login_cookie_history_download_and_cross_user_denials(api_client):
     client, server = api_client
     assert client.get("/api/sessions").status_code == 401

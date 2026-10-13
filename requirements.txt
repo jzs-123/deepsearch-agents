@@ -18,6 +18,7 @@ python-multipart>=0.0.6     # 文件上传支持
 
 # --- 数据库与存储 (Database) ---
 mysql-connector-python>=8.0.0  # MySQL 官方驱动，用于 mysql_tools
+sqlglot>=27,<31                # 生成 SQL 的语法树与查询口径校验
 
 # --- 文件处理 (File Processing - upload_file_read_tool) ---
 python-docx>=1.0.0          # Word (.docx) 读取

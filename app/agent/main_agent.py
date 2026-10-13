@@ -21,7 +21,8 @@ from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents.structured_output import ToolStrategy
-from app.agent.result import AgentResult, StructuredResultError, retry_structure, structure_retry_budget
+from app.agent.result import AgentResult, ArtifactRef, StructuredResultError, retry_structure, structure_retry_budget
+from app.agent.sql_query import DatabaseRun, database_run
 from app.core.config import settings
 from app.utils.path_utils import resolve_path
 
@@ -174,6 +175,8 @@ async def run_deep_agent(task_query: str, session_id: str, identity: Identity | 
     log_token = bind_thread_id(session_id)
     event_collector_token = monitor.bind_event_collector(collected_events)
     retry_token = structure_retry_budget.set([2])
+    db_scope = DatabaseRun(task_query)
+    db_token = database_run.set(db_scope)
 
     try:
         monitor.report_session_dir(session_dir_str)
@@ -199,8 +202,16 @@ async def run_deep_agent(task_query: str, session_id: str, identity: Identity | 
                                         monitor.report_assistant(subagent_type, {"description": subagent_desc})
             if not final_result:
                 raise StructuredResultError("Agent 未提交符合 Schema 的最终结果")
+            if db_scope.result:
+                other_assistants = any(event["event"] == "assistant_call" and event["data"].get("assistant_name") != database_query_agent["name"] for event in collected_events)
+                # 直接取数由程序呈现完整原始数据，防止主模型再漏行、改数或声称字段不存在。
+                if not other_assistants and db_scope.response_mode == "table" and all(Path(artifact.path).name == db_scope.artifact for artifact in final_result.artifacts):
+                    final_result.answer = db_scope.answer
+                    final_result.status = db_scope.status
+                if db_scope.artifact and not any(Path(artifact.path).name == db_scope.artifact for artifact in final_result.artifacts):
+                    final_result.artifacts.append(ArtifactRef(path=db_scope.artifact, title="数据库查询原始结果"))
             for artifact in final_result.artifacts:
-                path = Path(resolve_path(artifact.path))
+                path = Path(resolve_path(artifact.path, session_dir_str))
                 if not path.is_file():
                     raise StructuredResultError("Agent 引用的生成文件不存在")
                 artifact.path = str(path)
@@ -244,6 +255,7 @@ async def run_deep_agent(task_query: str, session_id: str, identity: Identity | 
         monitor.report_task_result(final_result)
         return final_result
     finally:
+        database_run.reset(db_token)
         monitor.reset_event_collector(event_collector_token)
         structure_retry_budget.reset(retry_token)
         reset_session_context(session_dir_token, session_id_token)

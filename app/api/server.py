@@ -14,6 +14,7 @@ FastAPI 接口层与项目闭环入口(企业级重构版)
 import asyncio
 import shutil
 import time
+from math import ceil
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -168,22 +169,24 @@ class RateLimitMiddleware:
             await JSONResponse(
                 status_code=429,
                 content={"detail": "请求过于频繁,请稍后重试"},
+                headers={"Retry-After": str(max(1, ceil(60 - (now - window[0]))))},
             )(scope, receive, send)
             return
         window.append(now)
         await self.app(scope, receive, send)
 
 
-# 本地前后端分别启动时，只允许配置中的页面来源携带凭证访问 API
+# CORS 包住限流响应并先处理预检，Request-ID 同时覆盖被限流的请求。
+app.add_middleware(RateLimitMiddleware, per_minute=settings.rate_limit_per_minute)
+app.add_middleware(RequestIDMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After", "X-Request-ID"],
 )
-app.add_middleware(RequestIDMiddleware)
-app.add_middleware(RateLimitMiddleware, per_minute=settings.rate_limit_per_minute)
 
 
 # ─── 任务并发治理 ────────────────────────────────────────────

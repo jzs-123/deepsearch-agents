@@ -27,6 +27,7 @@ dependencies = [
     "reportlab>=4.0.0",
     "requests>=2.31.0",
     "sqlalchemy>=2.0.0",
+    "sqlglot>=27,<31",
     "tavily-python==0.7.24",
     "tiktoken>=0.6.0",
     "typing-extensions>=4.5.0",

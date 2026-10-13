@@ -7,10 +7,13 @@ execute_sql_query 用于在确认结构后执行自定义查询。
 """
 
 import os
+import time
+from threading import Lock
 
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 from mysql.connector import Error, connect
+from sqlglot import parse_one
 
 from app.api.monitor import monitor
 from app.utils.sql_guard import assert_readonly_sql, validate_identifier
@@ -35,6 +38,7 @@ def get_db_config():
         "charset": os.getenv("MYSQL_CHARSET", "utf8mb4"),
         "collation": os.getenv("MYSQL_COLLATION", "utf8mb4_unicode_ci"),
         "autocommit": True,
+        "connection_timeout": 8,
         "sql_mode": os.getenv("MYSQL_SQL_MODE", "TRADITIONAL"),
     }
 
@@ -48,6 +52,45 @@ def get_db_config():
         raise ValueError(f"缺失数据库核心配置：{', '.join(missing_keys)}")
 
     return config
+
+
+_schema_cache = {}
+_schema_lock = Lock()
+
+
+def get_database_schema() -> dict:
+    """缓存五分钟的字段结构；不读取业务样例或缓存查询结果。"""
+    config = get_db_config()
+    key = tuple(sorted(config.items()))
+    with _schema_lock:
+        cached = _schema_cache.get(key)
+        if cached and time.monotonic() - cached[0] < 300:
+            return cached[1]
+        monitor.report_tool("数据库结构查询工具：get_database_schema", {})
+        with connect(**config) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT TABLE_NAME,COLUMN_NAME,DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=%s ORDER BY TABLE_NAME,ORDINAL_POSITION", (config["database"],))
+                schema = {}
+                for table, column, data_type in cursor.fetchall():
+                    schema.setdefault(table, {})[column] = data_type
+        if not schema:
+            raise ValueError("业务库没有可用的表结构")
+        _schema_cache[key] = (time.monotonic(), schema)
+        return schema
+
+
+def execute_database_query(query: str):
+    """已通过口径校验的查询；限制执行时间和取数，原始结果不交给模型重写。"""
+    with connect(**get_db_config()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SET SESSION max_execution_time = 10000")
+            tree = parse_one(query, read="mysql")
+            if not tree.args.get("limit"):
+                tree = tree.limit(10001)
+            cursor.execute(tree.sql(dialect="mysql"))
+            columns = [column[0] for column in cursor.description]
+            rows = cursor.fetchall()
+            return columns, rows[:10000], len(rows) > 10000
 
 
 @tool
